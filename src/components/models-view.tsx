@@ -581,6 +581,7 @@ export function ModelsView() {
           setConnectProvider(null);
           setConnectShowKey(false);
           flash("Custom endpoint connected!", "success");
+          requestRestart("Provider credentials were updated.");
           setLoading(true);
           fetchModels();
           fetchAllModels();
@@ -601,6 +602,7 @@ export function ModelsView() {
           setConnectProvider(null);
           setConnectShowKey(false);
           flash(`${CONNECT_PROVIDER_META[connectProvider]?.label || connectProvider} connected!`, "success");
+          requestRestart("Provider credentials were updated.");
           setLoading(true);
           fetchModels();
           fetchAllModels();
@@ -1251,7 +1253,7 @@ export function ModelsView() {
         { action: "set-models-mode", mode: next },
         `Provider catalog mode set to ${next}`,
         "providers:mode",
-        { restart: false },
+        { restart: true, refreshCatalog: true },
       );
     },
     [modelsCatalogConfig.mode, runAction],
@@ -1310,7 +1312,7 @@ export function ModelsView() {
       },
       `Saved provider override for ${provider}`,
       `providers:set:${provider}`,
-      { restart: false },
+      { restart: true, refreshCatalog: true },
     );
   }, [providerDraftJson, providerDraftResolvedId, runAction]);
 
@@ -1322,7 +1324,7 @@ export function ModelsView() {
         { action: "remove-provider-config", provider: key },
         `Removed provider override for ${key}`,
         `providers:remove:${key}`,
-        { restart: false },
+        { restart: true, refreshCatalog: true },
       );
     },
     [runAction],

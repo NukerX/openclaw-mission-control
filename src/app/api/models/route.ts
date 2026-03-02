@@ -1625,10 +1625,15 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        await runCli(
-          ["config", "set", "--strict-json", "models.mode", JSON.stringify(mode)],
-          10000
-        );
+        try {
+          await applyConfigPatchWithRetry({ models: { mode } });
+        } catch {
+          // Fallback to CLI if gateway config.patch unavailable
+          await runCli(
+            ["config", "set", "--strict-json", "models.mode", JSON.stringify(mode)],
+            10000
+          );
+        }
         return NextResponse.json({ ok: true, action, mode });
       }
 
@@ -1646,14 +1651,18 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        const path = providerConfigPath(provider);
+        // CLI "config set" REPLACES the value at the path, which is correct
+        // for provider config (user may have removed keys from the JSON).
+        // config.patch deep-merges objects and would keep stale keys.
+        const providerConfig = body.config as Record<string, unknown>;
+        const setPath = providerConfigPath(provider);
         await runCli(
           [
             "config",
             "set",
             "--strict-json",
-            path,
-            JSON.stringify(body.config as Record<string, unknown>),
+            setPath,
+            JSON.stringify(providerConfig),
           ],
           15000
         );
@@ -1668,8 +1677,10 @@ export async function POST(request: NextRequest) {
             { status: 400 }
           );
         }
-        const path = providerConfigPath(provider);
-        await runCli(["config", "unset", path], 10000);
+        // CLI "config unset" removes the key from disk directly.
+        // config.patch deep-merges objects and cannot delete keys.
+        const removePath = providerConfigPath(provider);
+        await runCli(["config", "unset", removePath], 10000);
         return NextResponse.json({ ok: true, action, provider });
       }
 
