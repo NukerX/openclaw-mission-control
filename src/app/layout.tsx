@@ -120,7 +120,7 @@ export default function RootLayout({
             </div>
             <AgentChatPanel />
             <ChatNotificationToast />
-            <OpenClawUpdateBanner />
+            {process.env.AGENTBAY_HOSTING !== "true" && <OpenClawUpdateBanner />}
             <UsageAlertMonitor />
           </SetupGate>
         </ThemeProvider>

@@ -64,6 +64,8 @@ type NavItem = {
   group?: string;
 };
 
+const isAgentbayHosting = process.env.NEXT_PUBLIC_AGENTBAY_HOSTING === "true";
+
 const navItems: NavItem[] = [
   // ── Core ──
   { group: "Core", section: "dashboard", label: "Dashboard", icon: LayoutDashboard, href: "/dashboard" },
@@ -91,7 +93,7 @@ const navItems: NavItem[] = [
   { section: "accounts", label: "Accounts & Keys", icon: KeyRound, href: "/accounts" },
   { section: "security", label: "Security", icon: ShieldCheck, href: "/security" },
   { section: "hooks", label: "Hooks", icon: Webhook, href: "/hooks" },
-  { section: "tailscale", label: "Tailscale", icon: Waypoints, href: "/tailscale" },
+  ...(!isAgentbayHosting ? [{ section: "tailscale", label: "Tailscale", icon: Waypoints, href: "/tailscale" } as NavItem] : []),
   { section: "settings", label: "Settings", icon: Settings2, href: "/settings" },
   { section: "config", label: "Config", icon: Settings, href: "/config" },
   // ── Monitoring ──

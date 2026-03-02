@@ -935,10 +935,11 @@ export async function GET(request: NextRequest) {
       if (parsedAllowedModels.length === 0 && fileSnapshot?.allowedModels.length) {
         parsedAllowedModels = fileSnapshot.allowedModels;
       }
-      if (
-        modelsCatalogConfig.providers.length === 0 &&
-        fileSnapshot?.modelsCatalogConfig.providers.length
-      ) {
+      // The file is the source of truth for models.providers because
+      // set-provider-config / remove-provider-config write via CLI
+      // (which correctly replaces/deletes values). The gateway's in-memory
+      // config may lag behind until restart, so always prefer the file.
+      if (fileSnapshot?.modelsCatalogConfig) {
         modelsCatalogConfig = fileSnapshot.modelsCatalogConfig;
       }
       if (listModels.length === 0 && fileSnapshot?.configuredModels.length) {

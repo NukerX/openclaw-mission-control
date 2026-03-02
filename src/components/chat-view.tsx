@@ -247,6 +247,14 @@ const PROVIDERS = [
   { id: "openrouter", emoji: "🟠", name: "OpenRouter", hint: "Many models", keyHint: "sk-or-...", url: "https://openrouter.ai/keys" },
 ] as const;
 
+/** Default model to use for each provider (matches onboarding-wizard.tsx) */
+const PROVIDER_DEFAULT_MODELS: Record<string, string> = {
+  anthropic: "anthropic/claude-sonnet-4-20250514",
+  openai: "openai/gpt-4o",
+  google: "google/gemini-2.0-flash",
+  openrouter: "openrouter/anthropic/claude-sonnet-4",
+};
+
 function ApiKeySetup({ onKeySaved, compact }: { onKeySaved: () => void; compact?: boolean }) {
   const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
   const [key, setKey] = useState("");
@@ -276,13 +284,24 @@ function ApiKeySetup({ onKeySaved, compact }: { onKeySaved: () => void; compact?
       });
       const data = await res.json();
       if (data.ok) {
+        // Also set this provider's default model as the primary so
+        // chat works immediately instead of falling back to an
+        // unconfigured provider (e.g. Anthropic when only OpenAI has a key).
+        const defaultModel = PROVIDER_DEFAULT_MODELS[selectedProvider];
+        if (defaultModel) {
+          fetch("/api/models", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ action: "set-primary", model: defaultModel }),
+          }).catch(() => {/* best-effort */});
+        }
         setSuccess(true);
         setTimeout(() => onKeySaved(), 600);
       } else {
-        setError(data.error || "Could not save — check your key and try again.");
+        setError(data.error || "That key didn\u2019t work. Double-check you copied the full key and try again.");
       }
     } catch {
-      setError("Connection failed — is your gateway running?");
+      setError("Can\u2019t connect to OpenClaw right now. Check the sidebar \u2014 if the gateway shows \u201coffline,\u201d click it to restart.");
     }
     setSaving(false);
   }, [selectedProvider, key, onKeySaved]);
@@ -456,6 +475,33 @@ function ChatPanel({
   const modelMenuRef = useRef<HTMLDivElement>(null);
   const prevMsgCountRef = useRef(0);
 
+  // Whether the agent model is known (not the placeholder "unknown" value)
+  const agentModelKnown = agentModel.includes("/");
+
+  // Whether the agent's default model provider has a configured API key
+  const defaultModelAvailable = useMemo(() => {
+    if (!modelsLoaded || availableModels.length === 0 || !agentModelKnown) return false;
+    const defaultProvider = agentModel.split("/")[0]; // e.g. "anthropic"
+    return availableModels.some((m) => m.key.split("/")[0] === defaultProvider);
+  }, [modelsLoaded, availableModels, agentModel, agentModelKnown]);
+
+  // Auto-select an available model when the default model's provider has no
+  // configured API key. This prevents chat from failing because the agent's
+  // default model (e.g. anthropic/claude-sonnet-*) belongs to a provider
+  // that the user hasn't connected yet.
+  useEffect(() => {
+    if (!modelsLoaded || availableModels.length === 0 || modelOverride) return;
+    if (!agentModelKnown) return; // wait for real agent data before deciding
+    if (defaultModelAvailable) return;
+
+    // Pick the best available model as an override
+    const preferredDefaults = Object.values(PROVIDER_DEFAULT_MODELS);
+    const best =
+      availableModels.find((m) => preferredDefaults.includes(m.key)) ||
+      availableModels[0];
+    if (best) setModelOverride(best.key);
+  }, [modelsLoaded, availableModels, modelOverride, defaultModelAvailable, agentModelKnown]);
+
   const addFiles = useCallback((files: FileList | File[]) => {
     const list = Array.isArray(files) ? files : Array.from(files);
     if (list.length) setAttachedFiles((prev) => [...prev, ...list]);
@@ -628,9 +674,17 @@ function ChatPanel({
                 <p className="mt-1 text-xs text-muted-foreground">
                   Send a message to start a conversation with your agent.
                 </p>
-                <p className="mt-0.5 text-xs text-muted-foreground/60">
-                  Using {formatModel(agentModel)}
-                </p>
+                {(modelOverride || agentModelKnown) && (
+                  <p className="mt-0.5 text-xs text-muted-foreground/60">
+                    Using {formatModel(modelOverride ?? agentModel)}
+                  </p>
+                )}
+                {modelOverride && !defaultModelAvailable && agentModelKnown && (
+                  <p className="mt-2 max-w-xs text-[11px] leading-relaxed text-amber-500/70">
+                    Auto-switched from {formatModel(agentModel)} because that provider
+                    isn&apos;t connected yet. You can change this in the model picker below.
+                  </p>
+                )}
               </div>
               {/* Quick prompts */}
               <div className="mt-4 flex flex-wrap justify-center gap-2">
@@ -787,17 +841,79 @@ function ChatPanel({
 
             {/* Error display */}
             {error && (
-              /No API key found|api[._-]key|auth.profiles|FailoverError|Configure auth/i.test(error.message) ? (
+              /No API key found|api[._-]key|auth.profiles|FailoverError|Configure auth|unauthorized|invalid.*key|401/i.test(error.message) ? (
                 /* Friendly API key error — inline setup */
                 <div className="mb-6 overflow-hidden rounded-xl border border-[var(--accent-brand-border)]/60 bg-card p-4 shadow-sm animate-modal-in">
                   <div className="mb-3 flex items-center gap-2">
                     <KeyRound className="h-3.5 w-3.5 text-[var(--accent-brand-text)]" />
                     <span className="text-xs font-medium text-[var(--accent-brand-text)]">Your agent needs an API key to reply</span>
                   </div>
+                  <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
+                    The AI provider rejected the request. This usually means your API key
+                    is missing, expired, or doesn&apos;t have enough credits. Add or update it below.
+                  </p>
                   <ApiKeySetup onKeySaved={onKeySaved} compact />
                 </div>
+              ) : /timeout|timed out|ECONNREFUSED|ENOTFOUND|fetch failed|network/i.test(error.message) ? (
+                /* Connection / network error */
+                <div className="mb-6 rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-amber-400">
+                      Connection problem
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const lastUser = [...messages].reverse().find((m) => m.role === "user");
+                        if (lastUser) {
+                          const retryText = lastUser.parts
+                            ?.filter((p): p is { type: "text"; text: string } => p.type === "text")
+                            .map((p) => p.text).join("") || "";
+                          if (retryText) sendMessage({ text: retryText });
+                        }
+                      }}
+                      className="flex items-center gap-1 rounded px-2 py-1 text-xs text-amber-400 transition-colors hover:bg-amber-500/10"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      Try again
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-amber-400/70">
+                    Could not reach the AI provider. Check that your internet connection is
+                    working and that the OpenClaw gateway is online (green dot in the sidebar).
+                  </p>
+                </div>
+              ) : /rate.?limit|429|quota|exceeded|billing/i.test(error.message) ? (
+                /* Rate limit / quota error */
+                <div className="mb-6 rounded-lg border border-amber-500/20 bg-amber-500/5 px-4 py-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-xs font-medium text-amber-400">
+                      Usage limit reached
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        const lastUser = [...messages].reverse().find((m) => m.role === "user");
+                        if (lastUser) {
+                          const retryText = lastUser.parts
+                            ?.filter((p): p is { type: "text"; text: string } => p.type === "text")
+                            .map((p) => p.text).join("") || "";
+                          if (retryText) sendMessage({ text: retryText });
+                        }
+                      }}
+                      className="flex items-center gap-1 rounded px-2 py-1 text-xs text-amber-400 transition-colors hover:bg-amber-500/10"
+                    >
+                      <RefreshCw className="h-3 w-3" />
+                      Try again
+                    </button>
+                  </div>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-amber-400/70">
+                    Your AI provider says you&apos;ve hit a usage or billing limit. Wait a minute
+                    and try again, or check your plan&apos;s dashboard to add credits.
+                  </p>
+                </div>
               ) : (
-                /* Generic error */
+                /* Generic error — still helpful */
                 <div className="mb-6 rounded-lg border border-red-500/20 bg-red-500/5 px-4 py-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-xs font-medium text-red-400">
@@ -829,6 +945,10 @@ function ChatPanel({
                   </div>
                   <p className="mt-1 text-xs text-red-400/70">
                     {error.message}
+                  </p>
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-red-400/50">
+                    If this keeps happening, try switching models (brain icon below),
+                    or visit the Doctor page from the sidebar to run a system check.
                   </p>
                 </div>
               )
@@ -926,22 +1046,24 @@ function ChatPanel({
                   </button>
                   {modelMenuOpen && (
                     <div className="absolute left-0 bottom-full z-50 mb-1 min-w-48 overflow-hidden rounded-lg border border-border bg-popover py-1 shadow-xl backdrop-blur-sm animate-enter">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setModelOverride(null);
-                          setModelMenuOpen(false);
-                        }}
-                        className={cn(
-                          "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors",
-                          !modelOverride
-                            ? "bg-violet-500/10 text-violet-600 dark:text-violet-300"
-                            : "text-foreground/80 hover:bg-muted hover:text-foreground"
-                        )}
-                      >
-                        <Brain className="h-3.5 w-3.5 shrink-0" />
-                        Default ({formatModel(agentModel)})
-                      </button>
+                      {defaultModelAvailable && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setModelOverride(null);
+                            setModelMenuOpen(false);
+                          }}
+                          className={cn(
+                            "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors",
+                            !modelOverride
+                              ? "bg-violet-500/10 text-violet-600 dark:text-violet-300"
+                              : "text-foreground/80 hover:bg-muted hover:text-foreground"
+                          )}
+                        >
+                          <Brain className="h-3.5 w-3.5 shrink-0" />
+                          Default ({formatModel(agentModel)})
+                        </button>
+                      )}
                       {availableModels.map((m) => (
                         <button
                           key={m.key}
