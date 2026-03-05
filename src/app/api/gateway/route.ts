@@ -1,5 +1,5 @@
 import { NextResponse } from "next/server";
-import { gatewayCall } from "@/lib/openclaw";
+import { gatewayCall, isReadOnlyMode } from "@/lib/openclaw";
 import { getOpenClawBin, getGatewayUrl } from "@/lib/paths";
 import { logRequest, logError } from "@/lib/request-log";
 import { execFile } from "child_process";
@@ -8,26 +8,40 @@ import { promisify } from "util";
 const exec = promisify(execFile);
 
 // ── Auto-enable OpenResponses endpoint for streaming chat ──
+// Uses a cooldown to avoid restart loops: once attempted (success or fail),
+// waits RETRY_COOLDOWN_MS before trying again. Never resets on failure.
 let _responsesEndpointEnsured = false;
+let _responsesLastAttempt = 0;
+const RESPONSES_RETRY_COOLDOWN_MS = 5 * 60_000; // 5 minutes
 
 function ensureResponsesEndpoint(): void {
   if (_responsesEndpointEnsured) return;
-  _responsesEndpointEnsured = true;
+  if (isReadOnlyMode()) return;
+  if (Date.now() - _responsesLastAttempt < RESPONSES_RETRY_COOLDOWN_MS) return;
+  _responsesLastAttempt = Date.now();
 
   // Fire-and-forget — don't block the health check response
   (async () => {
     try {
-      const cfg = await gatewayCall<{ hash?: string; config?: Record<string, unknown> }>(
+      const cfg = await gatewayCall<{
+        hash?: string;
+        parsed?: Record<string, unknown>;
+        config?: Record<string, unknown>;
+      }>(
         "config.get",
         undefined,
         8000,
       );
-      // Check if already enabled
-      const gw = (cfg?.config as Record<string, unknown>)?.gateway as Record<string, unknown> | undefined;
+      // Check both parsed (standard) and config (legacy) shapes
+      const root = cfg?.parsed ?? cfg?.config ?? {};
+      const gw = (root as Record<string, unknown>)?.gateway as Record<string, unknown> | undefined;
       const http = gw?.http as Record<string, unknown> | undefined;
       const endpoints = http?.endpoints as Record<string, unknown> | undefined;
       const responses = endpoints?.responses as Record<string, unknown> | undefined;
-      if (responses?.enabled === true) return; // Already enabled
+      if (responses?.enabled === true) {
+        _responsesEndpointEnsured = true; // Already enabled, no patch needed
+        return;
+      }
 
       await gatewayCall(
         "config.patch",
@@ -36,12 +50,14 @@ function ensureResponsesEndpoint(): void {
             gateway: { http: { endpoints: { responses: { enabled: true } } } },
           }),
           baseHash: String(cfg?.hash || ""),
+          restartDelayMs: 3000,
         },
         10000,
       );
+      _responsesEndpointEnsured = true;
     } catch {
-      // Non-fatal — streaming falls back to CLI
-      _responsesEndpointEnsured = false; // retry next health check
+      // Non-fatal — streaming falls back to CLI.
+      // Do NOT reset _responsesEndpointEnsured; cooldown timer handles retry.
     }
   })();
 }

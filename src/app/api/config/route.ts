@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { gatewayCall, runCliCaptureBoth } from "@/lib/openclaw";
+import { gatewayCall, runCliCaptureBoth, isReadOnlyError } from "@/lib/openclaw";
 import { readFile } from "fs/promises";
 import { join } from "path";
 import { getOpenClawHome } from "@/lib/paths";
@@ -412,6 +412,12 @@ function validateConfigPayload(
 
 export async function PATCH(request: NextRequest) {
   try {
+    if ((await import("@/lib/openclaw")).isReadOnlyMode()) {
+      return NextResponse.json(
+        { error: "Configuration changes are disabled in read-only mode." },
+        { status: 403 },
+      );
+    }
     const body = await request.json();
     const { raw, patch, baseHash } = body as {
       raw?: string;
@@ -565,6 +571,12 @@ export async function PATCH(request: NextRequest) {
  */
 export async function PUT(request: NextRequest) {
   try {
+    if ((await import("@/lib/openclaw")).isReadOnlyMode()) {
+      return NextResponse.json(
+        { error: "Configuration changes are disabled in read-only mode." },
+        { status: 403 },
+      );
+    }
     const body = await request.json();
     const { config, baseHash } = body as {
       config: Record<string, unknown>;

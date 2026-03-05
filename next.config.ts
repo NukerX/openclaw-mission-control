@@ -17,6 +17,7 @@ const nextConfig: NextConfig = {
     NEXT_PUBLIC_COMMIT_HASH: git("rev-parse --short HEAD") || "unknown",
     AGENTBAY_HOSTED: process.env.AGENTBAY_HOSTED || "false",
     NEXT_PUBLIC_AGENTBAY_HOSTED: process.env.NEXT_PUBLIC_AGENTBAY_HOSTED || process.env.AGENTBAY_HOSTED || "false",
+    OPENCLAW_READ_ONLY: process.env.OPENCLAW_READ_ONLY || "false",
   },
   headers: async () => [
     {

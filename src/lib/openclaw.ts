@@ -15,6 +15,36 @@ import type { RunCliResult } from "./openclaw-cli";
 export type { RunCliResult } from "./openclaw-cli";
 export { parseJsonFromCliOutput } from "./openclaw-cli";
 
+// ── Read-only mode ──────────────────────────────────
+// Blocks config-mutating RPC methods (config.patch, config.apply) when
+// OPENCLAW_READ_ONLY=true or AGENTBAY_HOSTED=true (hosted instances
+// should never write gateway config from the dashboard).
+
+const CONFIG_WRITE_METHODS = new Set(["config.patch", "config.apply"]);
+
+export function isReadOnlyMode(): boolean {
+  return (
+    process.env.OPENCLAW_READ_ONLY === "true" ||
+    process.env.AGENTBAY_HOSTED === "true"
+  );
+}
+
+export class ReadOnlyError extends Error {
+  readonly statusCode = 403;
+
+  constructor(method: string) {
+    super(
+      `Gateway write blocked: ${method} is not allowed in read-only mode. ` +
+      `Set OPENCLAW_READ_ONLY=false to enable config writes.`,
+    );
+    this.name = "ReadOnlyError";
+  }
+}
+
+export function isReadOnlyError(error: unknown): error is ReadOnlyError {
+  return error instanceof ReadOnlyError;
+}
+
 export async function runCli(
   args: string[],
   timeout = 15000,
@@ -45,6 +75,9 @@ export async function gatewayCall<T>(
   params?: Record<string, unknown>,
   timeout = 15000,
 ): Promise<T> {
+  if (CONFIG_WRITE_METHODS.has(method) && isReadOnlyMode()) {
+    throw new ReadOnlyError(method);
+  }
   const client = await getClient();
   return client.gatewayRpc<T>(method, params, timeout);
 }
