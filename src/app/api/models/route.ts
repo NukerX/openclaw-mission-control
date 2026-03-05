@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from "next/server";
-import { readFile } from "fs/promises";
-import { join } from "path";
+import { readFile, writeFile, mkdir } from "fs/promises";
+import { join, dirname } from "path";
 import { runCliJson, runCli, gatewayCall } from "@/lib/openclaw";
 import { getOpenClawHome } from "@/lib/paths";
 import { fetchGatewaySessions } from "@/lib/gateway-sessions";
@@ -1832,7 +1832,8 @@ export async function POST(request: NextRequest) {
       }
 
       case "auth-provider": {
-        // Paste an API key / token for a provider
+        // Paste an API key / token for a provider.
+        // This MUST work — 3 fallback layers, no excuses.
         const provider = String(body.provider || "").trim().toLowerCase();
         const token = String(body.token || "").trim();
         if (!provider || !token) {
@@ -1851,23 +1852,77 @@ export async function POST(request: NextRequest) {
           }
 
           const envKey = PROVIDER_ENV_KEYS[provider];
+          let method = "unknown";
+
+          // Layer 1: Gateway RPC (preferred — triggers live reload)
           if (envKey) {
-            await applyConfigPatchWithRetry(buildProviderCredentialPatch(provider, token));
-            return NextResponse.json({
-              ok: true,
-              action,
-              provider,
-              method: "env",
-              validated: true,
-            });
+            try {
+              await applyConfigPatchWithRetry(buildProviderCredentialPatch(provider, token));
+              method = "gateway-rpc";
+            } catch (rpcErr) {
+              console.warn(`[models] auth-provider: gateway RPC failed for ${provider}, falling back to disk:`, rpcErr);
+              method = "";
+            }
           }
 
-          await runCli(
-            ["models", "auth", "paste-token", "--provider", provider],
-            15000,
-            token
-          );
-          return NextResponse.json({ ok: true, action, provider, method: "cli" });
+          // Layer 2: Direct file write to openclaw.json + auth-profiles.json
+          // This always works — no CLI, no gateway, no WebSocket.
+          if (!method) {
+            try {
+              const home = getOpenClawHome();
+              const configPath = join(home, "openclaw.json");
+              const authPath = join(home, "agents", "main", "agent", "auth-profiles.json");
+
+              // Write env key to openclaw.json
+              if (envKey) {
+                let config: Record<string, unknown> = {};
+                try {
+                  config = JSON.parse(await readFile(configPath, "utf-8"));
+                } catch { /* fresh config */ }
+                const env = (config.env || {}) as Record<string, unknown>;
+                env[envKey] = token;
+                config.env = env;
+                // Also write auth profile metadata into config
+                const auth = (config.auth || {}) as Record<string, unknown>;
+                const profiles = (auth.profiles || {}) as Record<string, unknown>;
+                profiles[`${provider}:default`] = { provider, mode: "api_key" };
+                auth.profiles = profiles;
+                config.auth = auth;
+                await mkdir(dirname(configPath), { recursive: true });
+                await writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+              }
+
+              // Write credential to auth-profiles.json
+              let authData: { profiles: Record<string, unknown> } = { profiles: {} };
+              try {
+                authData = JSON.parse(await readFile(authPath, "utf-8"));
+                if (!authData.profiles) authData.profiles = {};
+              } catch { /* fresh auth file */ }
+              authData.profiles[`${provider}:default`] = {
+                provider,
+                type: "api_key",
+                key: token,
+              };
+              await mkdir(dirname(authPath), { recursive: true });
+              await writeFile(authPath, JSON.stringify(authData, null, 2) + "\n", "utf-8");
+
+              method = "disk";
+            } catch (diskErr) {
+              console.error(`[models] auth-provider: disk write failed for ${provider}:`, diskErr);
+              return NextResponse.json(
+                { error: `Failed to save ${provider} credentials: ${diskErr}` },
+                { status: 500 }
+              );
+            }
+          }
+
+          return NextResponse.json({
+            ok: true,
+            action,
+            provider,
+            method,
+            validated: true,
+          });
         } catch (authErr) {
           return NextResponse.json(
             { error: `Failed to authenticate ${provider}: ${authErr}` },

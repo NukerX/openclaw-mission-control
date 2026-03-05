@@ -395,12 +395,30 @@ export async function POST(request: NextRequest) {
             };
           }
 
+          // Try gateway RPC first (triggers live reload), fall back to disk
+          let savedViaGateway = false;
           if (Object.keys(gatewayPatch).length > 0) {
-            await applyGatewayConfigPatch(gatewayPatch);
+            try {
+              await applyGatewayConfigPatch(gatewayPatch);
+              savedViaGateway = true;
+            } catch (rpcErr) {
+              console.warn("[onboard] save-credentials: gateway RPC failed, falling back to disk:", rpcErr);
+            }
           }
 
-          // Custom/open-ended providers still need the local auth profile file for bearer tokens.
-          if ((provider === "custom" && apiKey) || !envKey) {
+          // Direct disk write as fallback (or always for custom/unknown providers)
+          if (!savedViaGateway) {
+            if (envKey) {
+              await ensureConfigValue(home, `env.${envKey}`, apiKey);
+            }
+            if (model) {
+              await ensureConfigValue(home, "agents.defaults.model.primary", model);
+            }
+          }
+
+          // Auth profile file — always write for custom/unknown providers,
+          // and as belt-and-suspenders for known providers too
+          if ((provider === "custom" && apiKey) || !envKey || !savedViaGateway) {
             await ensureAuthProfile(home, provider, apiKey || "local-no-auth");
           }
           return NextResponse.json({ ok: true });

@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
-import { access, readFile, readdir } from "fs/promises";
+import { access, readFile, readdir, writeFile, mkdir } from "fs/promises";
 import { constants as FS_CONSTANTS } from "fs";
-import { join } from "path";
+import { join, dirname } from "path";
 import { getDefaultWorkspaceSync, getOpenClawHome, getSystemSkillsDir } from "@/lib/paths";
 import { gatewayCall, runCliJson } from "@/lib/openclaw";
 import { buildModelsSummary } from "@/lib/models-summary";
@@ -1125,20 +1125,37 @@ export async function POST(request: NextRequest) {
       return jsonNoStore({ ok: false, error: "Value cannot be empty." }, { status: 400 });
     }
 
-    const cfg = await gatewayCall<GatewayConfigGet>("config.get", undefined, 15000);
-    const baseHash = String(cfg?.hash || "");
+    // Try gateway RPC first (triggers live reload), fall back to direct file write
+    let method = "gateway-rpc";
+    try {
+      const cfg = await gatewayCall<GatewayConfigGet>("config.get", undefined, 15000);
+      const baseHash = String(cfg?.hash || "");
+      await gatewayCall(
+        "config.patch",
+        {
+          raw: JSON.stringify({ env: { [key]: value } }),
+          baseHash,
+          restartDelayMs: 2000,
+        },
+        20000
+      );
+    } catch (rpcErr) {
+      console.warn("[accounts] update-env-key: gateway RPC failed, writing to disk:", rpcErr);
+      // Direct file write — cannot fail unless filesystem is read-only
+      const configPath = join(OPENCLAW_HOME, "openclaw.json");
+      let config: Record<string, unknown> = {};
+      try {
+        config = JSON.parse(await readFile(configPath, "utf-8"));
+      } catch { /* fresh config */ }
+      const env = (config.env || {}) as Record<string, unknown>;
+      env[key] = value;
+      config.env = env;
+      await mkdir(dirname(configPath), { recursive: true });
+      await writeFile(configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+      method = "disk";
+    }
 
-    await gatewayCall(
-      "config.patch",
-      {
-        raw: JSON.stringify({ env: { [key]: value } }),
-        baseHash,
-        restartDelayMs: 2000,
-      },
-      20000
-    );
-
-    return jsonNoStore({ ok: true, action, key });
+    return jsonNoStore({ ok: true, action, key, method });
   } catch (err) {
     return jsonNoStore(
       { ok: false, error: err instanceof Error ? err.message : String(err) },
