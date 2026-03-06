@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { readFile, readdir, stat, open } from "fs/promises";
 import { join } from "path";
-import { getOpenClawHome, getGatewayUrl, getGatewayPort } from "@/lib/paths";
+import { getOpenClawHome, getGatewayUrl, getGatewayPort, readConfigFile } from "@/lib/paths";
 import { fetchGatewaySessions, summarizeSessionsByAgent } from "@/lib/gateway-sessions";
 
 const OPENCLAW_HOME = getOpenClawHome();
@@ -113,11 +113,8 @@ export async function GET() {
       return { time: "", source: "unknown", message: line };
     }).reverse(); // newest first
 
-    // Read config metadata
-    const config = await readJsonSafe<Record<string, unknown>>(
-      join(OPENCLAW_HOME, "openclaw.json"),
-      {}
-    );
+    // Read config metadata (merged nested + outer)
+    const config = await readConfigFile();
     const meta = (config.meta || {}) as Record<string, unknown>;
 
     const gwPort = await getGatewayPort();
@@ -216,10 +213,7 @@ async function readAgentSessions(): Promise<AgentSessionRow[]> {
   const configuredAgentIds = new Set<string>();
   const identityByAgentId = new Map<string, { name: string; emoji: string }>();
   try {
-    const config = await readJsonSafe<Record<string, unknown>>(
-      join(OPENCLAW_HOME, "openclaw.json"),
-      {}
-    );
+    const config = await readConfigFile();
     const agents = (config.agents || {}) as Record<string, unknown>;
     const list = Array.isArray(agents.list) ? (agents.list as Record<string, unknown>[]) : [];
     for (const row of list) {

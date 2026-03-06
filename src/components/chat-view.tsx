@@ -21,14 +21,8 @@ import {
   Trash2,
   Paperclip,
   X,
-  Brain,
   KeyRound,
   ArrowRight,
-  ExternalLink,
-  Eye,
-  EyeOff,
-  Check,
-  Loader2,
 } from "lucide-react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
@@ -59,6 +53,7 @@ type Agent = {
 type ChatBootstrapResponse = {
   agents?: Agent[];
   models?: Array<{ key?: string; name?: string }>;
+  connectedProviders?: Array<{ id: string; name: string }>;
 };
 
 /* ── Agent display helpers ──────────────────────── */
@@ -82,9 +77,6 @@ function formatModel(model: string) {
   return parts[parts.length - 1] || model;
 }
 
-function possessiveLabel(name: string) {
-  return name.endsWith("s") ? `${name}'` : `${name}'s`;
-}
 
 function createChatSessionKey(agentId: string) {
   const suffix =
@@ -256,202 +248,6 @@ function MessageContent({ text }: { text: string }) {
   );
 }
 
-/* ── Inline API key setup ─────────────────────── */
-
-const PROVIDERS = [
-  { id: "openai", emoji: "🟢", name: "OpenAI", hint: "ChatGPT, GPT-4o", keyHint: "sk-...", url: "https://platform.openai.com/api-keys" },
-  { id: "anthropic", emoji: "🟣", name: "Anthropic", hint: "Claude", keyHint: "sk-ant-...", url: "https://console.anthropic.com/settings/keys" },
-  { id: "google", emoji: "🔵", name: "Google", hint: "Gemini", keyHint: "AIza...", url: "https://aistudio.google.com/apikey" },
-  { id: "openrouter", emoji: "🟠", name: "OpenRouter", hint: "Many models", keyHint: "sk-or-...", url: "https://openrouter.ai/keys" },
-] as const;
-
-/** Default model to use for each provider (matches onboarding-wizard.tsx) */
-const PROVIDER_DEFAULT_MODELS: Record<string, string> = {
-  anthropic: "anthropic/claude-sonnet-4-20250514",
-  openai: "openai/gpt-4o",
-  google: "google/gemini-2.0-flash",
-  openrouter: "openrouter/anthropic/claude-sonnet-4",
-};
-
-function ApiKeySetup({ onKeySaved, compact }: { onKeySaved: () => void; compact?: boolean }) {
-  const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
-  const [key, setKey] = useState("");
-  const [showKey, setShowKey] = useState(false);
-  const [saving, setSaving] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState(false);
-  const inputRef = useRef<HTMLInputElement>(null);
-
-  const provider = PROVIDERS.find((p) => p.id === selectedProvider);
-
-  useEffect(() => {
-    if (selectedProvider) {
-      setTimeout(() => inputRef.current?.focus(), 100);
-    }
-  }, [selectedProvider]);
-
-  const handleSave = useCallback(async () => {
-    if (!selectedProvider || !key.trim()) return;
-    setSaving(true);
-    setError(null);
-    try {
-      const res = await fetch("/api/models", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "auth-provider", provider: selectedProvider, token: key.trim() }),
-      });
-      const data = await res.json();
-      if (data.ok) {
-        // Also set this provider's default model as the primary so
-        // chat works immediately instead of falling back to an
-        // unconfigured provider (e.g. Anthropic when only OpenAI has a key).
-        const defaultModel = PROVIDER_DEFAULT_MODELS[selectedProvider];
-        if (defaultModel) {
-          fetch("/api/models", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ action: "set-primary", model: defaultModel }),
-          }).catch(() => {/* best-effort */});
-        }
-        setSuccess(true);
-        setTimeout(() => onKeySaved(), 600);
-      } else {
-        setError(data.error || "That key didn\u2019t work. Double-check you copied the full key and try again.");
-      }
-    } catch {
-      setError("Can\u2019t connect to OpenClaw right now. Check the sidebar \u2014 if the gateway shows \u201coffline,\u201d click it to restart.");
-    }
-    setSaving(false);
-  }, [selectedProvider, key, onKeySaved]);
-
-  if (success) {
-    return (
-      <div className={cn(
-        "flex items-center justify-center gap-2 rounded-2xl border border-emerald-500/30 bg-emerald-500/5 p-6 animate-modal-in",
-        compact && "p-4"
-      )}>
-        <div className="flex h-8 w-8 items-center justify-center rounded-full bg-emerald-500/20">
-          <Check className="h-4 w-4 text-emerald-500" />
-        </div>
-        <div>
-          <p className="text-sm font-medium text-emerald-600 dark:text-emerald-400">Connected!</p>
-          <p className="text-xs text-muted-foreground">Loading your models...</p>
-        </div>
-      </div>
-    );
-  }
-
-  return (
-    <div className={cn("w-full", compact && "max-w-full")}>
-      {!compact && (
-        <>
-          <div className="mb-5 flex items-center gap-3">
-            <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--accent-brand)] text-[var(--accent-brand-on)] shadow-sm">
-              <KeyRound className="h-5 w-5" />
-            </div>
-            <div>
-              <h3 className="text-sm font-semibold tracking-tight text-foreground">
-                Add your API key
-              </h3>
-              <p className="text-xs text-muted-foreground">
-                One-time setup &middot; takes 30 seconds
-              </p>
-            </div>
-          </div>
-          <p className="mb-5 text-xs leading-relaxed text-muted-foreground">
-            An API key is a password that lets your agent connect to an AI
-            service (like ChatGPT or Claude). Pick a provider, grab a key, and paste it below.
-          </p>
-        </>
-      )}
-
-      {/* Provider selector */}
-      <div className={cn("grid grid-cols-2 gap-2", compact ? "mb-3" : "mb-5")}>
-        {PROVIDERS.map((p) => (
-          <button
-            key={p.id}
-            type="button"
-            onClick={() => {
-              setSelectedProvider(selectedProvider === p.id ? null : p.id);
-              setKey("");
-              setError(null);
-              setShowKey(false);
-            }}
-            className={cn(
-              "group flex items-center gap-2.5 rounded-xl border px-3 py-2.5 text-left transition-all",
-              selectedProvider === p.id
-                ? "border-[var(--accent-brand-border)] bg-[var(--accent-brand-subtle)] shadow-sm"
-                : "border-foreground/8 bg-muted/40 hover:border-[var(--accent-brand-border)] hover:bg-[var(--accent-brand-subtle)] hover:shadow-sm"
-            )}
-          >
-            <span className="text-base">{p.emoji}</span>
-            <div className="min-w-0 flex-1">
-              <span className="block text-xs font-medium text-foreground/80">{p.name}</span>
-              <span className="block text-[11px] text-muted-foreground/60">{p.hint}</span>
-            </div>
-          </button>
-        ))}
-      </div>
-
-      {/* Key input (revealed after picking a provider) */}
-      {selectedProvider && provider && (
-        <div className="animate-modal-in space-y-2.5">
-          <div className="flex items-center justify-between">
-            <label className="text-xs font-medium text-foreground/80">
-              Paste your {provider.name} key
-            </label>
-            <a
-              href={provider.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-center gap-1 text-[11px] text-[var(--accent-brand-text)] hover:underline"
-            >
-              Get a key <ExternalLink className="h-2.5 w-2.5" />
-            </a>
-          </div>
-          <div className="flex gap-2">
-            <div className="relative flex-1">
-              <input
-                ref={inputRef}
-                type={showKey ? "text" : "password"}
-                value={key}
-                onChange={(e) => { setKey(e.target.value); setError(null); }}
-                onKeyDown={(e) => { if (e.key === "Enter" && key.trim()) handleSave(); }}
-                placeholder={provider.keyHint}
-                className="w-full rounded-lg border border-foreground/10 bg-card px-3 py-2 pr-9 font-mono text-xs text-foreground outline-none transition-colors placeholder:text-muted-foreground/40 focus:border-[var(--accent-brand-border)] focus:ring-1 focus:ring-[var(--accent-brand-ring)]"
-              />
-              <button
-                type="button"
-                onClick={() => setShowKey(!showKey)}
-                className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground/40 hover:text-foreground/60"
-                tabIndex={-1}
-              >
-                {showKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-              </button>
-            </div>
-            <button
-              type="button"
-              onClick={handleSave}
-              disabled={!key.trim() || saving}
-              className={cn(
-                "flex items-center gap-1.5 rounded-lg px-4 py-2 text-xs font-medium transition-all",
-                key.trim() && !saving
-                  ? "bg-[var(--accent-brand)] text-[var(--accent-brand-on)] shadow-sm hover:opacity-90 hover:shadow-md"
-                  : "bg-muted text-muted-foreground/60"
-              )}
-            >
-              {saving ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <ArrowRight className="h-3.5 w-3.5" />}
-              {saving ? "Saving..." : "Connect"}
-            </button>
-          </div>
-          {error && (
-            <p className="text-xs text-red-400">{error}</p>
-          )}
-        </div>
-      )}
-    </div>
-  );
-}
 
 /* ── Chat panel for a single agent ─────────────── */
 /* These are always mounted; hidden via CSS when not selected */
@@ -464,8 +260,8 @@ function ChatPanel({
   isSelected,
   isVisible,
   availableModels,
+  selectedProvider,
   modelsLoaded,
-  onKeySaved,
   isPostOnboarding,
   onClearPostOnboarding,
 }: {
@@ -476,8 +272,8 @@ function ChatPanel({
   isSelected: boolean;
   isVisible: boolean;
   availableModels: Array<{ key: string; name: string }>;
+  selectedProvider: string | null;
   modelsLoaded: boolean;
-  onKeySaved: () => void;
   isPostOnboarding: boolean;
   onClearPostOnboarding: () => void;
 }) {
@@ -486,87 +282,17 @@ function ChatPanel({
     getTimeFormatSnapshot,
     getTimeFormatServerSnapshot,
   );
-  const modelStorageKey = `mc-chat-model:${agentId}`;
   const [inputValue, setInputValue] = useState("");
   const [chatSessionKey, setChatSessionKey] = useState(() => {
     if (typeof window === "undefined") return "";
     return createChatSessionKey(agentId);
   });
-  const [modelOverride, setModelOverride] = useState<string | null>(() => {
-    if (typeof window === "undefined") return null;
-    try {
-      return localStorage.getItem(modelStorageKey) || null;
-    } catch {
-      return null;
-    }
-  });
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [attachedFiles, setAttachedFiles] = useState<File[]>([]);
   const [isDraggingOver, setIsDraggingOver] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const modelMenuRef = useRef<HTMLDivElement>(null);
   const prevMsgCountRef = useRef(0);
-
-  // Whether the agent model is known (not the placeholder "unknown" value)
-  const agentModelKnown = agentModel.includes("/");
-
-  // Whether the agent's default model provider has a configured API key
-  const defaultModelAvailable = useMemo(() => {
-    if (!modelsLoaded || availableModels.length === 0 || !agentModelKnown) return false;
-    const defaultProvider = agentModel.split("/")[0]; // e.g. "anthropic"
-    return availableModels.some((m) => m.key.split("/")[0] === defaultProvider);
-  }, [modelsLoaded, availableModels, agentModel, agentModelKnown]);
-
-  const manualChatModel = useMemo(() => {
-    const requested = modelOverride?.trim() || null;
-    if (!requested) return null;
-    if (!modelsLoaded || availableModels.length === 0) return requested;
-    return availableModels.some((m) => m.key === requested) ? requested : null;
-  }, [availableModels, modelOverride, modelsLoaded]);
-
-  const automaticChatModel = useMemo(() => {
-    if (manualChatModel) return null;
-    if (!modelsLoaded || availableModels.length === 0 || !agentModelKnown) return null;
-    if (defaultModelAvailable) return null;
-    const preferredDefaults = Object.values(PROVIDER_DEFAULT_MODELS);
-    return (
-      availableModels.find((m) => preferredDefaults.includes(m.key))?.key ||
-      availableModels[0]?.key ||
-      null
-    );
-  }, [
-    agentModelKnown,
-    availableModels,
-    defaultModelAvailable,
-    manualChatModel,
-    modelsLoaded,
-  ]);
-
-  const activeChatModel = manualChatModel ?? automaticChatModel;
-  const modelOverrideSource = manualChatModel
-    ? "manual"
-    : automaticChatModel
-      ? "automatic"
-      : "agent";
-  const activeChatModelLabel = activeChatModel
-    ? formatModel(activeChatModel)
-    : `${possessiveLabel(agentName)} setup`;
-  const agentSetupLabel = agentModelKnown ? formatModel(agentModel) : "unknown";
-
-  useEffect(() => {
-    if (typeof window === "undefined") return;
-    try {
-      if (modelOverride && (!modelsLoaded || availableModels.some((m) => m.key === modelOverride))) {
-        localStorage.setItem(modelStorageKey, modelOverride);
-      } else {
-        localStorage.removeItem(modelStorageKey);
-      }
-    } catch {
-      // Ignore storage failures; they should not block chat.
-    }
-  }, [availableModels, modelOverride, modelStorageKey, modelsLoaded]);
 
   const addFiles = useCallback((files: FileList | File[]) => {
     const list = Array.isArray(files) ? files : Array.from(files);
@@ -604,17 +330,6 @@ function ChatPanel({
     if (files?.length) addFiles(files);
   }, [addFiles]);
 
-  // Close model menu on click outside
-  useEffect(() => {
-    if (!modelMenuOpen) return;
-    const handleClick = (e: MouseEvent) => {
-      if (modelMenuRef.current && !modelMenuRef.current.contains(e.target as Node)) {
-        setModelMenuOpen(false);
-      }
-    };
-    document.addEventListener("mousedown", handleClick);
-    return () => document.removeEventListener("mousedown", handleClick);
-  }, [modelMenuOpen]);
 
   // Create transport for chat requests. Per-request fields are attached via sendMessage.
   const transport = useMemo(
@@ -683,12 +398,10 @@ function ChatPanel({
     ) => {
       const sessionKey = ensureChatSessionKey();
       await sendMessage(payload, {
-        body: activeChatModel
-          ? { agentId, model: activeChatModel, sessionKey }
-          : { agentId, sessionKey },
+        body: { agentId, sessionKey },
       });
     },
-    [activeChatModel, agentId, ensureChatSessionKey, sendMessage],
+    [agentId, ensureChatSessionKey, sendMessage],
   );
 
   const retryLastUserMessage = useCallback(() => {
@@ -761,12 +474,27 @@ function ChatPanel({
       <div className="flex-1 overflow-y-auto">
         {messages.length === 0 ? (
           noApiKeys ? (
-            /* ── No API keys — inline setup ── */
+            /* ── No models — redirect to /models ── */
             <div className="flex h-full items-center justify-center px-4 md:px-6">
-              <div className="relative w-full max-w-md animate-modal-in">
+              <div className="relative w-full max-w-sm animate-modal-in">
                 <div className="pointer-events-none absolute -inset-12 rounded-full bg-[var(--accent-brand)] opacity-[0.04] blur-3xl" />
-                <div className="relative rounded-2xl border border-[var(--accent-brand-border)]/60 bg-card p-6 shadow-lg shadow-[var(--accent-brand-ring)]/10">
-                  <ApiKeySetup onKeySaved={onKeySaved} />
+                <div className="relative rounded-2xl border border-[var(--accent-brand-border)]/60 bg-card p-6 text-center shadow-lg shadow-[var(--accent-brand-ring)]/10">
+                  <div className="mx-auto mb-4 flex h-10 w-10 items-center justify-center rounded-xl bg-[var(--accent-brand)] text-[var(--accent-brand-on)] shadow-sm">
+                    <KeyRound className="h-5 w-5" />
+                  </div>
+                  <h3 className="text-sm font-semibold tracking-tight text-foreground">
+                    No model configured
+                  </h3>
+                  <p className="mt-2 text-xs leading-relaxed text-muted-foreground">
+                    Connect an AI provider and choose a model to start chatting with your agent.
+                  </p>
+                  <a
+                    href="/models"
+                    className="mt-4 inline-flex items-center gap-2 rounded-lg bg-[var(--accent-brand)] px-4 py-2 text-xs font-medium text-[var(--accent-brand-on)] shadow-sm transition-all hover:opacity-90 hover:shadow-md"
+                  >
+                    <ArrowRight className="h-3.5 w-3.5" />
+                    Set up models
+                  </a>
                 </div>
               </div>
             </div>
@@ -783,20 +511,6 @@ function ChatPanel({
                 <p className="mt-1 text-xs text-muted-foreground">
                   Send a message to start a conversation with your agent.
                 </p>
-                {(activeChatModel || agentModelKnown) && (
-                  <p className="mt-0.5 text-xs text-muted-foreground/60">
-                    {activeChatModel
-                      ? `This chat will use ${activeChatModelLabel}.`
-                      : `This chat follows ${possessiveLabel(agentName)} setup (${agentSetupLabel}).`}
-                  </p>
-                )}
-                {activeChatModel && modelOverrideSource === "automatic" && !defaultModelAvailable && agentModelKnown && (
-                  <p className="mt-2 max-w-xs text-[11px] leading-relaxed text-amber-500/70">
-                    Mission Control temporarily switched this chat from {agentSetupLabel}
-                    to {activeChatModelLabel} because the agent&apos;s setup isn&apos;t
-                    ready right now.
-                  </p>
-                )}
               </div>
               {/* Quick prompts */}
               <div className="mt-4 flex flex-wrap justify-center gap-2">
@@ -953,11 +667,7 @@ function ChatPanel({
                     <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:150ms]" />
                     <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:300ms]" />
                   </span>
-                  <span className="text-xs text-muted-foreground">
-                    {activeChatModel
-                      ? `${agentName} is thinking with ${activeChatModelLabel}...`
-                      : `${agentName} is thinking...`}
-                  </span>
+                  <span className="text-xs text-muted-foreground">Thinking...</span>
                 </div>
               </div>
             )}
@@ -965,17 +675,23 @@ function ChatPanel({
             {/* Error display */}
             {error && (
               /No API key found|api[._-]key|auth.profiles|FailoverError|Configure auth|unauthorized|invalid.*key|401/i.test(error.message) ? (
-                /* Friendly API key error — inline setup */
+                /* Friendly API key error — redirect to models */
                 <div className="mb-6 overflow-hidden rounded-xl border border-[var(--accent-brand-border)]/60 bg-card p-4 shadow-sm animate-modal-in">
-                  <div className="mb-3 flex items-center gap-2">
+                  <div className="mb-2 flex items-center gap-2">
                     <KeyRound className="h-3.5 w-3.5 text-[var(--accent-brand-text)]" />
                     <span className="text-xs font-medium text-[var(--accent-brand-text)]">Your agent needs an API key to reply</span>
                   </div>
                   <p className="mb-3 text-[11px] leading-relaxed text-muted-foreground">
                     The AI provider rejected the request. This usually means your API key
-                    is missing, expired, or doesn&apos;t have enough credits. Add or update it below.
+                    is missing, expired, or doesn&apos;t have enough credits.
                   </p>
-                  <ApiKeySetup onKeySaved={onKeySaved} compact />
+                  <a
+                    href="/models"
+                    className="inline-flex items-center gap-1.5 rounded-lg bg-[var(--accent-brand)] px-3 py-1.5 text-xs font-medium text-[var(--accent-brand-on)] shadow-sm transition-all hover:opacity-90"
+                  >
+                    <ArrowRight className="h-3 w-3" />
+                    Go to Models
+                  </a>
                 </div>
               ) : /avoid sending your message with a different model|switch this chat back to the agent setup|could not use .* because the OpenClaw gateway/i.test(error.message) ? (
                 <div className="mb-6 rounded-lg border border-violet-500/20 bg-violet-500/5 px-4 py-3">
@@ -1142,69 +858,6 @@ function ChatPanel({
                 >
                   <Paperclip className="h-3.5 w-3.5" />
                 </button>
-                <div className="relative" ref={modelMenuRef}>
-                  <button
-                    type="button"
-                    onClick={() => setModelMenuOpen((open) => !open)}
-                    title={
-                      activeChatModel
-                        ? `This chat uses ${activeChatModelLabel}`
-                        : `This chat follows ${possessiveLabel(agentName)} setup (${agentSetupLabel})`
-                    }
-                    className={cn(
-                      "flex h-7 items-center gap-1 rounded-md px-1.5 text-xs transition-colors",
-                      activeChatModel
-                        ? "bg-violet-500/10 text-violet-400"
-                        : "text-muted-foreground/40 hover:bg-muted hover:text-foreground/70"
-                    )}
-                  >
-                    <Brain className="h-3.5 w-3.5" />
-                    <span className="hidden text-xs sm:inline">
-                      {activeChatModel
-                        ? `Chat: ${activeChatModelLabel}`
-                        : `Chat: ${agentSetupLabel}`}
-                    </span>
-                  </button>
-                  {modelMenuOpen && (
-                    <div className="absolute left-0 bottom-full z-50 mb-1 min-w-48 overflow-hidden rounded-lg border border-border bg-popover py-1 shadow-xl backdrop-blur-sm animate-enter">
-                      <button
-                        type="button"
-                        onClick={() => {
-                          setModelOverride(null);
-                          setModelMenuOpen(false);
-                        }}
-                        className={cn(
-                          "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors",
-                          !activeChatModel
-                            ? "bg-violet-500/10 text-violet-600 dark:text-violet-300"
-                            : "text-foreground/80 hover:bg-muted hover:text-foreground"
-                        )}
-                      >
-                        <Brain className="h-3.5 w-3.5 shrink-0" />
-                        Use agent setup ({agentSetupLabel})
-                      </button>
-                      {availableModels.map((m) => (
-                        <button
-                          key={m.key}
-                          type="button"
-                          onClick={() => {
-                            setModelOverride(m.key);
-                            setModelMenuOpen(false);
-                          }}
-                          className={cn(
-                            "flex w-full items-center gap-2 px-3 py-2 text-left text-xs transition-colors",
-                            activeChatModel === m.key
-                              ? "bg-violet-500/10 text-violet-600 dark:text-violet-300"
-                              : "text-foreground/80 hover:bg-muted hover:text-foreground"
-                          )}
-                        >
-                            <Cpu className="h-3.5 w-3.5 shrink-0" />
-                            {formatModel(m.name)}
-                          </button>
-                      ))}
-                    </div>
-                  )}
-                </div>
                 {messages.length > 0 && (
                   <button
                     type="button"
@@ -1216,24 +869,6 @@ function ChatPanel({
                   </button>
                 )}
               </div>
-              {activeChatModel && (
-                <div className="flex items-center justify-between gap-2 border-t border-foreground/8 px-3 pb-2 pt-1.5 text-[11px] sm:px-4">
-                  <p className="min-w-0 truncate text-muted-foreground/60">
-                    {modelOverrideSource === "automatic"
-                      ? `Temporary chat model: ${activeChatModelLabel}. Agent setup is ${agentSetupLabel}.`
-                      : `Chat model: ${activeChatModelLabel}. Agent setup: ${agentSetupLabel}.`}
-                  </p>
-                  <button
-                    type="button"
-                    onClick={() => {
-                      setModelOverride(null);
-                    }}
-                    className="shrink-0 text-[11px] font-medium text-violet-500/80 transition-colors hover:text-violet-500"
-                  >
-                    Use agent setup
-                  </button>
-                </div>
-              )}
             </div>
 
             <button
@@ -1276,10 +911,14 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
   const [selectedAgent, setSelectedAgent] = useState<string>("main");
   const [agentsLoading, setAgentsLoading] = useState(true);
   const [availableModels, setAvailableModels] = useState<Array<{ key: string; name: string }>>([]);
+  const [connectedProviders, setConnectedProviders] = useState<Array<{ id: string; name: string }>>([]);
+  const [selectedProvider, setSelectedProvider] = useState<string | null>(null);
+  const [providerDropdownOpen, setProviderDropdownOpen] = useState(false);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [agentDropdownOpen, setAgentDropdownOpen] = useState(false);
   const [now, setNow] = useState(() => Date.now());
   const dropdownRef = useRef<HTMLDivElement>(null);
+  const providerDropdownRef = useRef<HTMLDivElement>(null);
 
   // ── Warm-up state: friendly loading for new users ──
   const [warmupExpired, setWarmupExpired] = useState(false);
@@ -1323,6 +962,15 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
             }))
             .filter((m) => m.key)
         );
+        const providers = Array.isArray(data.connectedProviders) ? data.connectedProviders : [];
+        setConnectedProviders(providers);
+        if (providers.length > 0 && !selectedProvider) {
+          // Auto-select the provider of the current default model, or first provider
+          const defaultModel = agentList.find((a) => a.isDefault)?.model || "";
+          const defaultProv = defaultModel.split("/")[0];
+          const match = providers.find((p: { id: string }) => p.id === defaultProv);
+          setSelectedProvider(match?.id || providers[0]?.id || null);
+        }
         bootstrapLoadedRef.current = true;
         if (
           agentList.length > 0 &&
@@ -1399,20 +1047,20 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
     setChatActive(isVisible);
   }, [isVisible]);
 
-  // Close dropdown on click outside
+  // Close dropdowns on click outside
   useEffect(() => {
-    if (!agentDropdownOpen) return;
+    if (!agentDropdownOpen && !providerDropdownOpen) return;
     const handleClick = (e: MouseEvent) => {
-      if (
-        dropdownRef.current &&
-        !dropdownRef.current.contains(e.target as Node)
-      ) {
+      if (agentDropdownOpen && dropdownRef.current && !dropdownRef.current.contains(e.target as Node)) {
         setAgentDropdownOpen(false);
+      }
+      if (providerDropdownOpen && providerDropdownRef.current && !providerDropdownRef.current.contains(e.target as Node)) {
+        setProviderDropdownOpen(false);
       }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
-  }, [agentDropdownOpen]);
+  }, [agentDropdownOpen, providerDropdownOpen]);
 
   const currentAgent = useMemo(
     () => agents.find((a) => a.id === selectedAgent),
@@ -1499,22 +1147,8 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
               )}
             </div>
 
-            {/* Model badge */}
-            {currentAgent && (
-              <div className="flex items-center gap-1.5 rounded-full border border-stone-200 bg-white px-2.5 py-1 dark:border-stone-700 dark:bg-stone-800">
-                <Cpu className="h-3 w-3 text-stone-400 dark:text-stone-500" />
-                <span className="text-xs text-stone-500 dark:text-stone-300">
-                  Agent setup: {formatModel(currentAgent.model)}
-                </span>
-              </div>
-            )}
           </div>
 
-          <div className="flex shrink-0 items-center gap-1 text-xs text-stone-400 dark:text-stone-500">
-            <span>
-              {agents.length} agent{agents.length !== 1 ? "s" : ""}
-            </span>
-          </div>
         </div>
       </div>
 
@@ -1611,8 +1245,8 @@ export function ChatView({ isVisible = true }: { isVisible?: boolean }) {
               isSelected={agentId === selectedAgent}
               isVisible={isVisible}
               availableModels={availableModels}
+              selectedProvider={selectedProvider}
               modelsLoaded={modelsLoaded}
-              onKeySaved={fetchBootstrap}
               isPostOnboarding={isPostOnboarding}
               onClearPostOnboarding={clearPostOnboarding}
             />

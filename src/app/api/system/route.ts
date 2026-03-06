@@ -1,7 +1,7 @@
 import { NextResponse } from "next/server";
 import { readFile, readdir } from "fs/promises";
 import { join } from "path";
-import { getOpenClawHome, getSystemSkillsDir, getDefaultWorkspaceSync } from "@/lib/paths";
+import { getOpenClawHome, getSystemSkillsDir, getDefaultWorkspaceSync, readConfigFile } from "@/lib/paths";
 import { fetchGatewaySessions, type NormalizedGatewaySession } from "@/lib/gateway-sessions";
 
 const OPENCLAW_HOME = getOpenClawHome();
@@ -321,11 +321,7 @@ export async function GET() {
     }
 
     systemInFlight = (async () => {
-      const configPath = join(OPENCLAW_HOME, "openclaw.json");
-      const config = await readJsonSafe<Record<string, unknown>>(
-        configPath,
-        {}
-      );
+      const config = await readConfigFile();
 
       const gatewaySessions = await fetchGatewaySessions(10000).catch(() => []);
       const sessions = toSessionInfo(gatewaySessions);

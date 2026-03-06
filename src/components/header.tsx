@@ -129,7 +129,7 @@ export function AgentChatPanel() {
 
   // Fetch agents once
   useEffect(() => {
-    fetch("/api/agents")
+    fetch("/api/agents", { signal: AbortSignal.timeout(8000) })
       .then((r) => r.json())
       .then((data) => {
         const list = (data.agents || data || []) as AgentInfo[];
@@ -219,7 +219,7 @@ export function AgentChatPanel() {
         top: 56,
         zIndex: 99999,
       }}
-      className="flex max-h-screen w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-2xl border border-foreground/10 bg-card/95 shadow-2xl backdrop-blur-md animate-in slide-in-from-top-2 fade-in duration-200 sm:w-auto sm:max-w-md"
+      className="flex max-h-[min(70vh,600px)] w-[calc(100vw-2rem)] flex-col overflow-hidden rounded-2xl border border-foreground/10 bg-card/95 shadow-2xl backdrop-blur-md animate-in slide-in-from-top-2 fade-in duration-200 sm:w-auto sm:max-w-md"
     >
       {/* Header */}
       <div className="flex shrink-0 items-center justify-between border-b border-foreground/10 px-4 py-2.5">

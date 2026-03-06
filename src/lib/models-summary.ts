@@ -382,8 +382,8 @@ function parseParsedConfigSnapshot(
 
 async function readConfigFileSnapshot(): Promise<ParsedConfigSnapshot | null> {
   try {
-    const raw = await readFile(join(OPENCLAW_HOME, "openclaw.json"), "utf8");
-    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    const { readConfigFile } = await import("@/lib/paths");
+    const parsed = await readConfigFile();
     return parseParsedConfigSnapshot(parsed);
   } catch {
     return null;

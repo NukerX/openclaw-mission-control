@@ -8,12 +8,31 @@ import { useSmartPoll } from "@/hooks/use-smart-poll";
 
 type NotificationEvent = {
   id: string;
-  type: "cron" | "session" | "log" | "system";
+  type: "cron" | "session" | "log" | "system" | "pairing";
   timestamp: number;
   title: string;
   detail?: string;
   status?: "ok" | "error" | "info" | "warning";
   source?: string;
+};
+
+type PairingResponse = {
+  dm?: Array<{
+    channel: string;
+    code: string;
+    account?: string;
+    senderId?: string;
+    senderName?: string;
+    message?: string;
+    createdAt?: string;
+  }>;
+  devices?: Array<{
+    requestId: string;
+    displayName?: string;
+    platform?: string;
+    role?: string;
+    createdAtMs?: number;
+  }>;
 };
 
 function timeAgo(ts: number): string {
@@ -39,6 +58,7 @@ const TYPE_ICON: Record<string, React.ComponentType<{ className?: string }>> = {
   session: Zap,
   log: Terminal,
   system: Radio,
+  pairing: Bell,
 };
 
 const TYPE_ROUTE: Record<string, string> = {
@@ -46,6 +66,7 @@ const TYPE_ROUTE: Record<string, string> = {
   session: "/sessions",
   log: "/logs",
   system: "/activity",
+  pairing: "/channels",
 };
 
 const TYPE_QUERY_PARAM: Record<string, string> = {
@@ -70,6 +91,7 @@ export function NotificationCenter() {
     } catch { return new Set(); }
   });
   const panelRef = useRef<HTMLDivElement>(null);
+  const slowBackgroundPolling = !open;
 
   // Persist readIds to localStorage whenever it changes
   useEffect(() => {
@@ -80,20 +102,56 @@ export function NotificationCenter() {
 
   const fetchNotifications = useCallback(async () => {
     try {
-      const res = await fetch("/api/activity", { cache: "no-store" });
-      if (!res.ok) return;
-      const data = (await res.json()) as NotificationEvent[];
-      // Only show actionable events (errors, warnings, and cron failures)
-      const actionable = (Array.isArray(data) ? data : []).filter(
+      const [activityRes, pairingRes] = await Promise.all([
+        open
+          ? fetch("/api/activity", { cache: "no-store", signal: AbortSignal.timeout(6000) })
+          : Promise.resolve(new Response("[]", { status: 200 })),
+        fetch("/api/pairing", { cache: "no-store", signal: AbortSignal.timeout(6000) }),
+      ]);
+
+      const activityData = activityRes.ok ? ((await activityRes.json()) as NotificationEvent[]) : [];
+      const pairingData = pairingRes.ok ? ((await pairingRes.json()) as PairingResponse) : {};
+
+      // Only show actionable activity events (errors and warnings).
+      const actionable = (Array.isArray(activityData) ? activityData : []).filter(
         (e) => e.status === "error" || e.status === "warning"
       );
-      setEvents(actionable.slice(0, 20));
+
+      const pairingEvents: NotificationEvent[] = [
+        ...((pairingData.dm || []).map((req) => ({
+          id: `pairing:dm:${req.channel}:${req.account || "default"}:${req.code}`,
+          type: "pairing" as const,
+          timestamp: req.createdAt ? new Date(req.createdAt).getTime() || Date.now() : Date.now(),
+          title: `${req.channel} pairing request`,
+          detail:
+            req.senderName || req.senderId
+              ? `${req.senderName || req.senderId}${req.message ? `: ${req.message}` : ""}`
+              : "New sender waiting for approval",
+          status: "warning" as const,
+          source: req.channel,
+        }))),
+        ...((pairingData.devices || []).map((req) => ({
+          id: `pairing:device:${req.requestId}`,
+          type: "pairing" as const,
+          timestamp: req.createdAtMs || Date.now(),
+          title: "Device pairing request",
+          detail: req.displayName || req.platform || req.role || "A device is waiting for approval",
+          status: "warning" as const,
+          source: req.requestId,
+        }))),
+      ];
+
+      const merged = [...pairingEvents, ...actionable]
+        .sort((a, b) => b.timestamp - a.timestamp)
+        .slice(0, 20);
+
+      setEvents(merged);
     } catch {
       /* ignore */
     }
-  }, []);
+  }, [open]);
 
-  useSmartPoll(fetchNotifications, { intervalMs: 15_000 });
+  useSmartPoll(fetchNotifications, { intervalMs: slowBackgroundPolling ? 60_000 : 20_000 });
 
   // Close on click outside
   useEffect(() => {
@@ -156,6 +214,7 @@ export function NotificationCenter() {
     <div className="relative" ref={panelRef}>
       <button
         type="button"
+        data-notification-bell
         onClick={handleOpen}
         className={cn(
           "relative flex h-9 w-9 items-center justify-center rounded-md border border-stone-200 bg-white text-stone-500 transition-colors hover:bg-stone-100 hover:text-stone-700 dark:border-[#2c343d] dark:bg-[#171a1d] dark:text-[#a8b0ba] dark:hover:bg-[#20252a] dark:hover:text-[#f5f7fa]",
@@ -207,7 +266,10 @@ export function NotificationCenter() {
             ) : (
               events.map((event) => {
                 const isUnread = event.timestamp > lastSeenTs && !readIds.has(event.id);
-                const Icon = STATUS_ICON[event.status || "info"] || Info;
+                const Icon =
+                  event.type === "pairing"
+                    ? TYPE_ICON.pairing
+                    : STATUS_ICON[event.status || "info"] || Info;
                 return (
                   <button
                     key={event.id}

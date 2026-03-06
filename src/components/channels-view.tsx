@@ -1,1173 +1,1130 @@
 "use client";
 
-import Link from "next/link";
-import { useEffect, useState, useCallback, useRef } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
-  Check,
-  X,
-  RefreshCw,
-  AlertTriangle,
-  ExternalLink,
-  Rocket,
-  Play,
-  Plug,
-  Plus,
+  AlertCircle,
   Bell,
-  Monitor,
-  Shield,
-  ChevronDown,
+  BotMessageSquare,
+  Check,
+  ChevronLeft,
+  ChevronRight,
+  Clock,
+  ExternalLink,
+  Loader2,
+  MessageCircle,
+  Plus,
+  QrCode,
+  RefreshCw,
+  Settings,
+  Trash2,
+  UserCheck,
+  WifiOff,
+  X,
+  Zap,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
-import { SectionBody, SectionLayout } from "@/components/section-layout";
+import { SectionBody, SectionHeader, SectionLayout } from "@/components/section-layout";
 import { LoadingState } from "@/components/ui/loading-state";
 import { QrLoginModal } from "@/components/qr-login-modal";
+import { useSmartPoll } from "@/hooks/use-smart-poll";
 
-/* ── Types ────────────────────────────────────────── */
+/* ── Types ──────────────────────────────────────── */
 
-type ChannelRuntimeStatus = {
-  channel: string;
-  account: string;
-  status: string;
-  linked?: boolean;
-  connected?: boolean;
-  error?: string;
-};
+type ChannelId = "telegram" | "discord" | "whatsapp";
 
-type ChannelCatalogItem = {
-  channel: string;
+type Channel = {
+  id: string;
   label: string;
   icon: string;
-  setupType: "qr" | "token" | "cli" | "auto";
-  setupCommand: string;
-  setupHint: string;
-  configHint?: string;
-  tokenLabel?: string;
-  tokenPlaceholder?: string;
+  setup: string;
+  tokenLabel: string;
+  tokenPlaceholder: string;
+  hint?: string;
   docsUrl?: string;
   enabled: boolean;
   configured: boolean;
-  accounts: string[];
-  statuses: ChannelRuntimeStatus[];
+  connected: boolean;
+  error?: string | null;
   dmPolicy?: string;
   groupPolicy?: string;
+  accounts?: string[];
 };
 
-type DmPairingRequest = {
+type PairingRequest = {
   channel: string;
   code: string;
+  account?: string;
   senderId?: string;
   senderName?: string;
   message?: string;
-  createdAt?: string;
 };
 
-type DevicePairingRequest = {
-  requestId: string;
-  displayName?: string;
-  platform?: string;
-  role?: string;
-  roles?: string[];
-  createdAtMs?: number;
+type ValidateResult = {
+  ok: boolean;
+  botName?: string;
+  botUsername?: string;
+  error?: string;
 };
 
-type PairedDevice = {
-  deviceId: string;
-  displayName?: string;
-  platform: string;
-  role: string;
-  roles: string[];
-  createdAtMs: number;
-  approvedAtMs: number;
+type WizardStep = "pick" | "setup" | "validating" | "connected" | "waiting";
+
+type WizardState = {
+  step: WizardStep;
+  channelId: ChannelId | null;
+  token: string;
+  validateResult: ValidateResult | null;
+  error: string | null;
 };
 
-type Toast = { message: string; type: "success" | "error" };
+/* ── Static channel metadata ─────────────────────── */
 
-const URL_PATTERN = /(https?:\/\/[^\s]+)/g;
+type ChannelMeta = {
+  color: string;
+  bgColor: string;
+  borderColor: string;
+  icon: React.ReactNode;
+  description: string;
+  steps: { text: string; link?: { label: string; url: string } }[];
+  tokenLabel: string;
+  tokenPlaceholder: string;
+  hint: string;
+  docsUrl: string;
+  usesQr: boolean;
+};
 
-function LinkifiedText({ text, className }: { text: string; className?: string }) {
-  const parts = text.split(URL_PATTERN);
+const CHANNEL_META: Record<ChannelId, ChannelMeta> = {
+  telegram: {
+    color: "text-sky-400",
+    bgColor: "bg-sky-500/10",
+    borderColor: "border-sky-500/20",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="currentColor" className="h-6 w-6">
+        <path d="M12 0C5.373 0 0 5.373 0 12s5.373 12 12 12 12-5.373 12-12S18.627 0 12 0zm5.562 8.248-1.97 9.28c-.145.658-.537.818-1.084.508l-3-2.21-1.447 1.394c-.16.16-.295.295-.605.295l.213-3.053 5.56-5.023c.242-.213-.054-.333-.373-.12l-6.871 4.326-2.962-.924c-.643-.204-.657-.643.136-.953l11.57-4.461c.537-.194 1.006.131.833.941z" />
+      </svg>
+    ),
+    description: "Connect via your Telegram bot token",
+    steps: [
+      { text: "Open Telegram on your phone or computer" },
+      {
+        text: "Start a chat with @BotFather",
+        link: { label: "Open BotFather", url: "https://t.me/BotFather" },
+      },
+      { text: 'Send the message "/newbot" and follow the prompts to name your bot' },
+      { text: "Copy the token BotFather gives you — it looks like: 123456:ABC-DEF..." },
+    ],
+    tokenLabel: "Bot Token",
+    tokenPlaceholder: "123456789:ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghi",
+    hint: "Your token is stored only on this device. We never send it to our servers.",
+    docsUrl: "https://core.telegram.org/bots/tutorial",
+    usesQr: false,
+  },
+  discord: {
+    color: "text-indigo-400",
+    bgColor: "bg-indigo-500/10",
+    borderColor: "border-indigo-500/20",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="currentColor" className="h-6 w-6">
+        <path d="M20.317 4.37a19.791 19.791 0 0 0-4.885-1.515.074.074 0 0 0-.079.037c-.21.375-.444.864-.608 1.25a18.27 18.27 0 0 0-5.487 0 12.64 12.64 0 0 0-.617-1.25.077.077 0 0 0-.079-.037A19.736 19.736 0 0 0 3.677 4.37a.07.07 0 0 0-.032.027C.533 9.046-.32 13.58.099 18.057c.002.022.014.043.031.056a19.9 19.9 0 0 0 5.993 3.03.078.078 0 0 0 .084-.028c.462-.63.874-1.295 1.226-1.994a.076.076 0 0 0-.041-.106 13.107 13.107 0 0 1-1.872-.892.077.077 0 0 1-.008-.128 10.2 10.2 0 0 0 .372-.292.074.074 0 0 1 .077-.01c3.928 1.793 8.18 1.793 12.062 0a.074.074 0 0 1 .078.01c.12.098.246.198.373.292a.077.077 0 0 1-.006.127 12.299 12.299 0 0 1-1.873.892.077.077 0 0 0-.041.107c.36.698.772 1.362 1.225 1.993a.076.076 0 0 0 .084.028 19.839 19.839 0 0 0 6.002-3.03.077.077 0 0 0 .032-.054c.5-5.177-.838-9.674-3.549-13.66a.061.061 0 0 0-.031-.03zM8.02 15.33c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.956-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.956 2.418-2.157 2.418zm7.975 0c-1.183 0-2.157-1.085-2.157-2.419 0-1.333.955-2.419 2.157-2.419 1.21 0 2.176 1.096 2.157 2.42 0 1.333-.946 2.418-2.157 2.418z" />
+      </svg>
+    ),
+    description: "Connect via your Discord bot token",
+    steps: [
+      {
+        text: "Go to the Discord Developer Portal",
+        link: { label: "Open Portal", url: "https://discord.com/developers/applications" },
+      },
+      { text: 'Click "New Application", give it a name, then open the "Bot" tab' },
+      { text: 'Click "Add Bot" to create your bot user' },
+      { text: 'Enable "Message Content Intent" under Privileged Gateway Intents' },
+      { text: 'Click "Reset Token", then copy your token' },
+      { text: "Invite the bot to your server via the OAuth2 URL Generator (scopes: bot, permissions: Send Messages + Read Message History)" },
+    ],
+    tokenLabel: "Bot Token",
+    tokenPlaceholder: "paste-your-discord-bot-token-here",
+    hint: "Your token is stored only on this device. We never send it to our servers.",
+    docsUrl: "https://discord.com/developers/docs/intro",
+    usesQr: false,
+  },
+  whatsapp: {
+    color: "text-emerald-400",
+    bgColor: "bg-emerald-500/10",
+    borderColor: "border-emerald-500/20",
+    icon: (
+      <svg viewBox="0 0 24 24" fill="currentColor" className="h-6 w-6">
+        <path d="M17.472 14.382c-.297-.149-1.758-.867-2.03-.967-.273-.099-.471-.148-.67.15-.197.297-.767.966-.94 1.164-.173.199-.347.223-.644.075-.297-.15-1.255-.463-2.39-1.475-.883-.788-1.48-1.761-1.653-2.059-.173-.297-.018-.458.13-.606.134-.133.298-.347.446-.52.149-.174.198-.298.298-.497.099-.198.05-.371-.025-.52-.075-.149-.669-1.612-.916-2.207-.242-.579-.487-.5-.669-.51-.173-.008-.371-.01-.57-.01-.198 0-.52.074-.792.372-.272.297-1.04 1.016-1.04 2.479 0 1.462 1.065 2.875 1.213 3.074.149.198 2.096 3.2 5.077 4.487.709.306 1.262.489 1.694.625.712.227 1.36.195 1.871.118.571-.085 1.758-.719 2.006-1.413.248-.694.248-1.289.173-1.413-.074-.124-.272-.198-.57-.347m-5.421 7.403h-.004a9.87 9.87 0 0 1-5.031-1.378l-.361-.214-3.741.982.998-3.648-.235-.374a9.86 9.86 0 0 1-1.51-5.26c.001-5.45 4.436-9.884 9.888-9.884 2.64 0 5.122 1.03 6.988 2.898a9.825 9.825 0 0 1 2.893 6.994c-.003 5.45-4.437 9.884-9.885 9.884m8.413-18.297A11.815 11.815 0 0 0 12.05 0C5.495 0 .16 5.335.157 11.892c0 2.096.547 4.142 1.588 5.945L.057 24l6.305-1.654a11.882 11.882 0 0 0 5.683 1.448h.005c6.554 0 11.89-5.335 11.893-11.893a11.821 11.821 0 0 0-3.48-8.413z" />
+      </svg>
+    ),
+    description: "Connect by scanning a QR code with your phone",
+    steps: [
+      { text: "Open WhatsApp on your phone" },
+      { text: 'Tap the three dots (Android) or Settings (iPhone), then "Linked Devices"' },
+      { text: 'Tap "Link a Device"' },
+      { text: "Point your camera at the QR code that appears on screen" },
+    ],
+    tokenLabel: "",
+    tokenPlaceholder: "",
+    hint: "Your WhatsApp session is stored locally and never shared.",
+    docsUrl: "https://faq.whatsapp.com/1317564962315842",
+    usesQr: true,
+  },
+};
+
+const CHANNEL_IDS: ChannelId[] = ["telegram", "discord", "whatsapp"];
+
+/* ── Shared atoms ────────────────────────────────── */
+
+function ChannelIcon({
+  channelId,
+  size = "md",
+}: {
+  channelId: ChannelId;
+  size?: "sm" | "md" | "lg";
+}) {
+  const meta = CHANNEL_META[channelId];
+  const sizeClass =
+    size === "sm" ? "h-8 w-8" : size === "lg" ? "h-14 w-14" : "h-10 w-10";
+  const svgClass =
+    size === "sm"
+      ? "[&_svg]:h-4 [&_svg]:w-4"
+      : size === "lg"
+        ? "[&_svg]:h-7 [&_svg]:w-7"
+        : "[&_svg]:h-5 [&_svg]:w-5";
   return (
-    <span className={className}>
-      {parts.map((part, index) =>
-        /^https?:\/\/[^\s]+$/.test(part) ? (
-          <a
-            key={`${part}-${index}`}
-            href={part}
-            target="_blank"
-            rel="noreferrer"
-            className="underline decoration-violet-400/60 underline-offset-2 transition-colors hover:text-violet-300"
-          >
-            {part}
-          </a>
-        ) : (
-          <span key={`${part}-${index}`}>{part}</span>
-        )
+    <div
+      className={cn(
+        "flex shrink-0 items-center justify-center rounded-xl border",
+        sizeClass,
+        svgClass,
+        meta.bgColor,
+        meta.color,
+        meta.borderColor
       )}
+    >
+      {meta.icon}
+    </div>
+  );
+}
+
+function StatusDot({
+  connected,
+  className,
+}: {
+  connected: boolean;
+  className?: string;
+}) {
+  return (
+    <span className={cn("relative flex h-2.5 w-2.5", className)}>
+      {connected && (
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-40" />
+      )}
+      <span
+        className={cn(
+          "relative inline-flex h-2.5 w-2.5 rounded-full",
+          connected ? "bg-emerald-400" : "bg-[#3d4752]"
+        )}
+      />
     </span>
   );
 }
 
-function getPostSetupChecklist(channel: string): string[] {
-  switch (channel) {
-    case "discord":
-      return [
-        "Create/configure your app in https://discord.com/developers/applications and enable Message Content Intent.",
-        "Invite the bot to your server with message permissions (or use DMs).",
-        "The gateway restarts automatically on config changes.",
-        "Send a DM to the bot (or message it in a server channel where it has access).",
-        "If DM policy is pairing, new contacts will appear in the Pending Pairings section below for approval.",
-      ];
-    case "telegram":
-      return [
-        "Create/verify token with https://t.me/BotFather and ensure it is configured.",
-        "The gateway restarts automatically on config changes.",
-        "Open Telegram and send a message to your bot.",
-        "If DM policy is pairing, new contacts will appear in the Pending Pairings section below for approval.",
-        "Optional: add the bot to a group and mention it to validate group routing.",
-      ];
-    case "whatsapp":
-      return [
-        "After QR linking, the gateway stays running automatically.",
-        "Message the linked WhatsApp identity from an allowed number.",
-        "If DM policy is pairing, new contacts will appear in the Pending Pairings section below for approval.",
-        "For stable ops, use a dedicated WhatsApp number when possible.",
-      ];
-    case "slack":
-      return [
-        "Open https://api.slack.com/apps and confirm Socket Mode is enabled.",
-        "Confirm the Slack app is installed to your workspace and required scopes are granted.",
-        "Invite the bot to a channel (or DM it directly).",
-        "The gateway restarts automatically on config changes.",
-        "Send a test message and confirm a reply in the same channel.",
-      ];
-    case "signal":
-      return [
-        "Follow the official Signal channel guide to register and link signal-cli.",
-        "Configure the Signal channel in OpenClaw before enabling it here.",
-        "Return to this page and refresh runtime status after the gateway has loaded the channel.",
-        "Send a test Signal message only after the account shows as configured.",
-      ];
-    default:
-      return [
-        "The gateway restarts automatically on config changes.",
-        "Send a test message to this channel integration.",
-        "If pairing is enabled, new contacts will appear in the Pending Pairings section below for approval.",
-        "Channel status is shown live on this page.",
-      ];
-  }
+function StepNumber({ n }: { n: number }) {
+  return (
+    <span className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-[#20252a] text-xs font-semibold tabular-nums text-[#a8b0ba] ring-1 ring-[#2c343d]">
+      {n}
+    </span>
+  );
 }
 
-export function ChannelsView() {
-  const [channels, setChannels] = useState<ChannelCatalogItem[]>([]);
-  const [channelsLoading, setChannelsLoading] = useState(true);
-  const [busy, setBusy] = useState(false);
+/* ── Wizard ──────────────────────────────────────── */
 
-  const [wizardOpen, setWizardOpen] = useState(false);
-  const [wizardStep, setWizardStep] = useState<1 | 2 | 3>(1);
-  const [wizardChannel, setWizardChannel] = useState("");
-  const [wizardToken, setWizardToken] = useState("");
-  const [wizardAppToken, setWizardAppToken] = useState("");
-  const [wizardAccount, setWizardAccount] = useState("");
-  const [wizardRunning, setWizardRunning] = useState(false);
-  const [wizardOutput, setWizardOutput] = useState("");
-  const [wizardError, setWizardError] = useState("");
+function AddChannelWizard({
+  onClose,
+  onConnected,
+}: {
+  onClose: () => void;
+  onConnected: (channelId: string) => void;
+}) {
+  const [wizard, setWizard] = useState<WizardState>({
+    step: "pick",
+    channelId: null,
+    token: "",
+    validateResult: null,
+    error: null,
+  });
+  const [showQr, setShowQr] = useState(false);
+  const tokenInputRef = useRef<HTMLInputElement>(null);
 
-  const [qrModalOpen, setQrModalOpen] = useState(false);
-  const [qrChannel, setQrChannel] = useState<"whatsapp">("whatsapp");
+  const meta = wizard.channelId ? CHANNEL_META[wizard.channelId] : null;
 
-  // Pairing & Devices
-  const [dmPairings, setDmPairings] = useState<DmPairingRequest[]>([]);
-  const [devicePairings, setDevicePairings] = useState<DevicePairingRequest[]>([]);
-  const [pairedDevices, setPairedDevices] = useState<PairedDevice[]>([]);
-  const [pairingBusy, setPairingBusy] = useState<string | null>(null);
-  const [expandedChannels, setExpandedChannels] = useState<Set<string>>(new Set());
+  function pickChannel(id: ChannelId) {
+    setWizard({ step: "setup", channelId: id, token: "", validateResult: null, error: null });
+    setTimeout(() => tokenInputRef.current?.focus(), 80);
+  }
 
-  const [toast, setToast] = useState<Toast | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  function goBack() {
+    if (wizard.step === "validating") return;
+    setWizard({ step: "pick", channelId: null, token: "", validateResult: null, error: null });
+  }
 
-  const flash = useCallback((message: string, type: "success" | "error" = "success") => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    setToast({ message, type });
-    toastTimer.current = setTimeout(() => setToast(null), 4000);
-  }, []);
+  async function handleConnect() {
+    if (!wizard.channelId) return;
 
-  const fetchChannels = useCallback(async () => {
-    try {
-      const res = await fetch("/api/channels?scope=all", { cache: "no-store" });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      setChannels((data.channels || []) as ChannelCatalogItem[]);
-    } catch (err) {
-      flash(String(err), "error");
-    } finally {
-      setChannelsLoading(false);
+    if (CHANNEL_META[wizard.channelId].usesQr) {
+      // Enable WhatsApp in config before showing QR
+      try {
+        await fetch("/api/channels", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action: "connect", channel: wizard.channelId }),
+        });
+      } catch {
+        // Best effort — QR login may still work
+      }
+      setShowQr(true);
+      return;
     }
-  }, [flash]);
 
-  const fetchPairings = useCallback(async () => {
-    try {
-      const res = await fetch("/api/pairing", { cache: "no-store" });
-      const data = await res.json();
-      setDmPairings((data.dm || []) as DmPairingRequest[]);
-      setDevicePairings((data.devices || []) as DevicePairingRequest[]);
-    } catch {
-      // silently degrade
+    if (!wizard.token.trim()) {
+      setWizard((s) => ({ ...s, error: "Please paste your bot token before connecting." }));
+      return;
     }
-  }, []);
 
-  const fetchDevices = useCallback(async () => {
-    try {
-      const res = await fetch("/api/devices", { cache: "no-store" });
-      const data = await res.json();
-      setPairedDevices((data.paired || []) as PairedDevice[]);
-    } catch {
-      // silently degrade
-    }
-  }, []);
-
-  useEffect(() => {
-    void fetchChannels();
-    void fetchPairings();
-    void fetchDevices();
-  }, [fetchChannels, fetchPairings, fetchDevices]);
-
-  const runChannelAction = useCallback(
-    async (body: Record<string, unknown>, successMsg: string) => {
-      setBusy(true);
-      try {
-        const res = await fetch("/api/channels", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        flash(successMsg);
-        await fetchChannels();
-      } catch (err) {
-        flash(String(err), "error");
-      } finally {
-        setBusy(false);
-      }
-    },
-    [fetchChannels, flash]
-  );
-
-  const approveDmPairing = useCallback(
-    async (channel: string, code: string) => {
-      setPairingBusy(`dm:${channel}:${code}`);
-      try {
-        const res = await fetch("/api/pairing", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "approve-dm", channel, code }),
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        flash(`Approved pairing for ${channel}`);
-        await fetchPairings();
-      } catch (err) {
-        flash(String(err), "error");
-      } finally {
-        setPairingBusy(null);
-      }
-    },
-    [flash, fetchPairings]
-  );
-
-  const handleDeviceAction = useCallback(
-    async (action: "approve" | "reject" | "revoke", id: string, role?: string) => {
-      setPairingBusy(`device:${action}:${id}`);
-      try {
-        const endpoint = action === "revoke" ? "/api/devices" : "/api/pairing";
-        const body: Record<string, unknown> =
-          action === "revoke"
-            ? { action: "revoke", deviceId: id, role: role || "user" }
-            : { action: `${action}-device`, requestId: id };
-        const res = await fetch(endpoint, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(body),
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        flash(`Device ${action}d`);
-        await Promise.all([fetchPairings(), fetchDevices()]);
-      } catch (err) {
-        flash(String(err), "error");
-      } finally {
-        setPairingBusy(null);
-      }
-    },
-    [flash, fetchPairings, fetchDevices]
-  );
-
-  const setChannelPolicy = useCallback(
-    async (channel: string, field: "dmPolicy" | "groupPolicy", value: string) => {
-      setBusy(true);
-      try {
-        const res = await fetch("/api/channels", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ action: "set-policy", channel, [field]: value }),
-        });
-        const data = await res.json();
-        if (data.error) throw new Error(data.error);
-        flash(`${field === "dmPolicy" ? "DM" : "Group"} policy updated for ${channel}`);
-        await fetchChannels();
-      } catch (err) {
-        flash(String(err), "error");
-      } finally {
-        setBusy(false);
-      }
-    },
-    [flash, fetchChannels]
-  );
-
-  const toggleChannelExpanded = useCallback((channel: string) => {
-    setExpandedChannels((prev) => {
-      const next = new Set(prev);
-      if (next.has(channel)) next.delete(channel);
-      else next.add(channel);
-      return next;
-    });
-  }, []);
-
-  const setupCandidates = channels.filter((ch) => !ch.configured && ch.setupType !== "auto");
-  const selectedWizardChannel = channels.find((ch) => ch.channel === wizardChannel) || null;
-  const requiresAppToken = selectedWizardChannel?.channel === "slack";
-  const needsToken = selectedWizardChannel?.setupType === "token";
-  const canRunWizard =
-    !!selectedWizardChannel &&
-    (selectedWizardChannel.setupType !== "token" ||
-      (wizardToken.trim().length > 0 && (!requiresAppToken || wizardAppToken.trim().length > 0)));
-
-  const openWizard = useCallback(
-    (channelId?: string) => {
-      const fallback = setupCandidates[0]?.channel || channels[0]?.channel || "";
-      const targetChannel = channelId || fallback;
-      setWizardChannel(targetChannel);
-      // If user clicked Setup/Reconfigure on a specific channel, jump directly to Configure.
-      // Keep step 1 only for generic "Add Channel".
-      setWizardStep(channelId ? 2 : 1);
-      setWizardToken("");
-      setWizardAppToken("");
-      setWizardAccount("");
-      setWizardOutput("");
-      setWizardError("");
-      setWizardOpen(true);
-    },
-    [channels, setupCandidates]
-  );
-
-  const runWizardSetup = useCallback(async () => {
-    if (!selectedWizardChannel) return;
-    setWizardRunning(true);
-    setWizardError("");
-    setWizardOutput("");
+    setWizard((s) => ({ ...s, step: "validating", error: null }));
 
     try {
-      if (selectedWizardChannel.setupType === "auto") {
-        setWizardOutput("No setup required. This channel is available automatically.");
-        setWizardStep(3);
-        return;
-      }
-
-      if (selectedWizardChannel.setupType === "cli") {
-        setWizardOutput(
-          selectedWizardChannel.setupHint ||
-            "Manual setup is required for this channel. Follow the official docs, then come back here to verify status."
-        );
-        setWizardStep(3);
-        return;
-      }
-
-      const account = wizardAccount.trim();
-      const setupCommand = selectedWizardChannel.setupCommand.toLowerCase();
-      const needsLogin =
-        selectedWizardChannel.setupType === "qr" ||
-        setupCommand.includes("channels login");
-
-      const payload: Record<string, unknown> = {
-        action: needsLogin ? "login" : "add",
-        channel: selectedWizardChannel.channel,
-      };
-      if (account) payload.account = account;
-
-      if (selectedWizardChannel.setupType === "token") {
-        if (!wizardToken.trim()) {
-          throw new Error(`${selectedWizardChannel.tokenLabel || "Token"} is required.`);
-        }
-        payload.token = wizardToken.trim();
-        if (wizardAppToken.trim()) payload.appToken = wizardAppToken.trim();
-      }
-
-      const res = await fetch("/api/channels", {
+      const validateRes = await fetch("/api/channels/validate", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
+        body: JSON.stringify({ channel: wizard.channelId, token: wizard.token.trim() }),
       });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const result: ValidateResult = await validateRes.json();
 
-      if (data.interactive) {
-        // WhatsApp is the only in-app QR login flow Mission Control supports.
-        const ch = selectedWizardChannel.channel;
-        if (ch === "whatsapp") {
-          setQrChannel("whatsapp");
-          setQrModalOpen(true);
-          setWizardRunning(false);
-          return;
-        }
-        setWizardOutput(
-          data.message ||
-            "Interactive login is required. Run the command below in the Terminal tab."
-        );
-      } else {
-        setWizardOutput(
-          typeof data.output === "string" && data.output.trim().length > 0
-            ? data.output
-            : `${selectedWizardChannel.label} setup command completed.`
-        );
+      if (!result.ok) {
+        setWizard((s) => ({
+          ...s,
+          step: "setup",
+          error:
+            result.error ??
+            "Token validation failed. Double-check you copied it correctly and try again.",
+        }));
+        return;
       }
 
-      // Idempotent: if setup worked, ensure channel is enabled.
       await fetch("/api/channels", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ action: "enable", channel: selectedWizardChannel.channel }),
-      }).catch(() => null);
+        body: JSON.stringify({
+          action: "connect",
+          channel: wizard.channelId,
+          token: wizard.token.trim(),
+        }),
+      });
 
-      await fetchChannels();
-      setWizardStep(3);
-      flash(
-        data.interactive
-          ? `${selectedWizardChannel.label}: continue in Terminal for interactive login`
-          : `${selectedWizardChannel.label} configured`
-      );
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      setWizardError(message);
-      flash(message, "error");
-    } finally {
-      setWizardRunning(false);
+      setWizard((s) => ({ ...s, step: "connected", validateResult: result }));
+    } catch {
+      setWizard((s) => ({
+        ...s,
+        step: "setup",
+        error: "Network error. Check your connection and try again.",
+      }));
     }
-  }, [
-    fetchChannels,
-    flash,
-    selectedWizardChannel,
-    wizardAccount,
-    wizardAppToken,
-    wizardToken,
-  ]);
+  }
 
-  const statusTone = (status: string) => {
-    const s = status.toLowerCase();
-    if (s.includes("connected") || s.includes("ready") || s.includes("online") || s.includes("idle")) {
-      return "text-emerald-400";
-    }
-    if (s.includes("error") || s.includes("failed") || s.includes("offline") || s.includes("not-configured")) {
-      return "text-red-400";
-    }
-    return "text-amber-400";
+  function handleQrSuccess() {
+    setShowQr(false);
+    setWizard((s) => ({
+      ...s,
+      step: "connected",
+      validateResult: { ok: true, botName: "Your WhatsApp" },
+    }));
+    if (wizard.channelId) onConnected(wizard.channelId);
+  }
+
+  function proceedToWaiting() {
+    setWizard((s) => ({ ...s, step: "waiting" }));
+    if (wizard.channelId) onConnected(wizard.channelId);
+  }
+
+  function handleDone() {
+    if (wizard.channelId) onConnected(wizard.channelId);
+    onClose();
+  }
+
+  const stepTitle: Record<WizardStep, string> = {
+    pick: "Add a messaging channel",
+    setup: "Set up your connection",
+    validating: "Verifying token...",
+    connected: "Channel connected!",
+    waiting: "Waiting for first message",
   };
 
-  if (channelsLoading) {
-    return (
-      <SectionLayout>
-        <LoadingState label="Loading channels..." />
-      </SectionLayout>
-    );
+  return (
+    <>
+      <div className="animate-backdrop-in fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm sm:items-center">
+        <div className="animate-modal-in mx-0 flex w-full max-w-lg flex-col rounded-t-2xl border border-[#2c343d] bg-[#171a1d] shadow-2xl sm:mx-4 sm:rounded-2xl">
+          {/* Header */}
+          <div className="flex shrink-0 items-center gap-3 border-b border-[#2c343d] px-5 py-4">
+            {wizard.step !== "pick" && (
+              <button
+                type="button"
+                onClick={goBack}
+                disabled={wizard.step === "validating"}
+                aria-label="Go back"
+                className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#a8b0ba] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa] disabled:opacity-40"
+              >
+                <ChevronLeft className="h-4 w-4" />
+              </button>
+            )}
+            <div className="min-w-0 flex-1">
+              <h2 className="text-sm font-semibold text-[#f5f7fa]">
+                {stepTitle[wizard.step]}
+              </h2>
+              {wizard.step === "pick" && (
+                <p className="mt-0.5 text-xs text-[#7a8591]">
+                  Choose a platform to connect your AI assistant to
+                </p>
+              )}
+              {wizard.step === "setup" && wizard.channelId && (
+                <p className="mt-0.5 text-xs text-[#7a8591]">
+                  Follow the steps below, then paste your token
+                </p>
+              )}
+            </div>
+            <button
+              type="button"
+              onClick={onClose}
+              aria-label="Close"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#7a8591] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa]"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+
+          {/* Scrollable body */}
+          <div className="min-h-0 flex-1 overflow-y-auto">
+            {/* Step: pick */}
+            {wizard.step === "pick" && (
+              <div className="grid grid-cols-1 gap-3 p-5">
+                {CHANNEL_IDS.map((id) => {
+                  const m = CHANNEL_META[id];
+                  return (
+                    <button
+                      key={id}
+                      type="button"
+                      onClick={() => pickChannel(id)}
+                      className="group flex w-full items-center gap-4 rounded-xl border border-[#2c343d] bg-[#15191d] p-4 text-left transition-all hover:border-[#3d4752] hover:bg-[#1d2227] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#34d399]/30"
+                    >
+                      <ChannelIcon channelId={id} size="md" />
+                      <div className="min-w-0 flex-1">
+                        <div className="flex items-center gap-2">
+                          <span className="text-sm font-semibold text-[#f5f7fa]">
+                            {id.charAt(0).toUpperCase() + id.slice(1)}
+                          </span>
+                          {id === "whatsapp" && (
+                            <span className="rounded-full border border-emerald-500/20 bg-emerald-500/10 px-1.5 py-0.5 text-[10px] font-medium text-emerald-400">
+                              QR code
+                            </span>
+                          )}
+                        </div>
+                        <p className="mt-0.5 text-xs text-[#7a8591]">{m.description}</p>
+                      </div>
+                      <ChevronRight className="h-4 w-4 shrink-0 text-[#3d4752] transition-colors group-hover:text-[#7a8591]" />
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+
+            {/* Step: setup */}
+            {wizard.step === "setup" && wizard.channelId && meta && (
+              <div className="p-5 space-y-4">
+                {/* Instructions card */}
+                <div className="rounded-xl border border-[#2c343d] bg-[#15191d] p-4">
+                  <div className="mb-3 flex items-center gap-2.5">
+                    <ChannelIcon channelId={wizard.channelId} size="sm" />
+                    <span className="text-xs font-semibold text-[#d6dce3]">
+                      {meta.usesQr ? "How to link your phone" : "How to get your token"}
+                    </span>
+                  </div>
+                  <ol className="space-y-3">
+                    {meta.steps.map((step, i) => (
+                      <li key={i} className="flex items-start gap-3">
+                        <StepNumber n={i + 1} />
+                        <p className="pt-0.5 text-xs leading-relaxed text-[#a8b0ba]">
+                          {step.text}
+                          {step.link && (
+                            <a
+                              href={step.link.url}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="ml-2 inline-flex items-center gap-1 text-[#34d399] underline-offset-2 hover:underline"
+                            >
+                              {step.link.label}
+                              <ExternalLink className="h-2.5 w-2.5" />
+                            </a>
+                          )}
+                        </p>
+                      </li>
+                    ))}
+                  </ol>
+                </div>
+
+                {/* Token input */}
+                {!meta.usesQr && (
+                  <div className="space-y-2">
+                    <label
+                      htmlFor="channel-token"
+                      className="block text-xs font-medium text-[#d6dce3]"
+                    >
+                      {meta.tokenLabel}
+                    </label>
+                    <input
+                      ref={tokenInputRef}
+                      id="channel-token"
+                      type="text"
+                      value={wizard.token}
+                      onChange={(e) =>
+                        setWizard((s) => ({ ...s, token: e.target.value, error: null }))
+                      }
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") void handleConnect();
+                      }}
+                      placeholder={meta.tokenPlaceholder}
+                      autoComplete="off"
+                      spellCheck={false}
+                      className={cn(
+                        "w-full rounded-lg border bg-[#15191d] px-3 py-2.5 font-mono text-sm text-[#f5f7fa] placeholder-[#3d4752]",
+                        "transition-colors focus:outline-none focus:ring-2",
+                        wizard.error
+                          ? "border-red-500/40 focus:border-red-500/40 focus:ring-red-500/20"
+                          : "border-[#2c343d] focus:border-[#34d399]/40 focus:ring-[#34d399]/20"
+                      )}
+                    />
+                    {wizard.error && (
+                      <p className="flex items-center gap-1.5 text-xs text-red-400">
+                        <AlertCircle className="h-3 w-3 shrink-0" />
+                        {wizard.error}
+                      </p>
+                    )}
+                    <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-[#7a8591]">
+                      <Check className="mt-0.5 h-3 w-3 shrink-0 text-[#34d399]" />
+                      {meta.hint}
+                    </p>
+                  </div>
+                )}
+
+                {/* WhatsApp QR placeholder */}
+                {meta.usesQr && (
+                  <div className="flex flex-col items-center gap-2 rounded-xl border border-[#2c343d] bg-[#15191d] p-6 text-center">
+                    <QrCode className="h-10 w-10 text-[#3d4752]" />
+                    <p className="text-sm text-[#a8b0ba]">
+                      Click "Open QR scanner" and a code will appear.
+                    </p>
+                    <p className="text-xs text-[#7a8591]">Have your phone ready before clicking.</p>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Step: validating */}
+            {wizard.step === "validating" && (
+              <div className="flex flex-col items-center gap-4 py-14">
+                <div className="relative flex h-16 w-16 items-center justify-center">
+                  <div className="absolute inset-0 rounded-full bg-[#34d399]/10" />
+                  <Loader2 className="h-8 w-8 animate-spin text-[#34d399]" />
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-medium text-[#f5f7fa]">Checking your token...</p>
+                  <p className="mt-1 text-xs text-[#7a8591]">This only takes a moment</p>
+                </div>
+              </div>
+            )}
+
+            {/* Step: connected */}
+            {wizard.step === "connected" && wizard.channelId && (
+              <div className="flex flex-col items-center gap-5 px-5 py-10">
+                <div className="relative flex h-16 w-16 items-center justify-center">
+                  <div className="absolute inset-0 rounded-full bg-emerald-500/15" />
+                  <Check className="h-8 w-8 text-emerald-400" strokeWidth={2.5} />
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-semibold text-[#f5f7fa]">
+                    {wizard.validateResult?.botName
+                      ? `Connected as ${wizard.validateResult.botName}`
+                      : "Successfully connected!"}
+                  </p>
+                  {wizard.validateResult?.botUsername && (
+                    <p className="mt-0.5 text-xs text-[#7a8591]">
+                      @{wizard.validateResult.botUsername}
+                    </p>
+                  )}
+                </div>
+                <div className="w-full rounded-xl border border-[#34d399]/20 bg-[#34d399]/5 p-4">
+                  <div className="flex items-start gap-3">
+                    <Bell className="mt-0.5 h-4 w-4 shrink-0 text-[#34d399]" />
+                    <div>
+                      <p className="text-xs font-semibold text-[#d6dce3]">
+                        {wizard.channelId === "whatsapp"
+                          ? "Now send a message from WhatsApp"
+                          : "Now send your bot a message"}
+                      </p>
+                      <p className="mt-1 text-[11px] leading-relaxed text-[#7a8591]">
+                        When someone messages your bot for the first time, a pairing request will appear in your dashboard. Approve it and they can start chatting with your AI.
+                      </p>
+                    </div>
+                  </div>
+                </div>
+                {wizard.channelId === "telegram" && wizard.validateResult?.botUsername && (
+                  <a
+                    href={`https://t.me/${wizard.validateResult.botUsername}`}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-2 rounded-lg border border-[#34d399]/30 bg-[#34d399]/10 px-4 py-2 text-sm font-medium text-[#34d399] transition-colors hover:bg-[#34d399]/20"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" /> Open @{wizard.validateResult.botUsername} in Telegram
+                  </a>
+                )}
+              </div>
+            )}
+
+            {/* Step: waiting */}
+            {wizard.step === "waiting" && (
+              <div className="flex flex-col items-center gap-5 px-5 py-10">
+                <div className="relative flex h-16 w-16 items-center justify-center">
+                  <div className="absolute inset-0 animate-ping rounded-full bg-amber-500/20" />
+                  <div className="absolute inset-0 rounded-full bg-amber-500/10" />
+                  <Clock className="h-8 w-8 text-amber-400" />
+                </div>
+                <div className="text-center">
+                  <p className="text-sm font-semibold text-[#f5f7fa]">Waiting for a message</p>
+                  <p className="mt-1.5 max-w-xs text-xs leading-relaxed text-[#7a8591]">
+                    Send your bot a message now. When it receives its first message, a pairing request will appear — you approve it, and the conversation begins.
+                  </p>
+                </div>
+                <div className="flex w-full items-center gap-2 rounded-lg border border-[#2c343d] bg-[#15191d] px-3 py-2.5">
+                  <RefreshCw className="h-3.5 w-3.5 animate-spin text-[#3d4752]" />
+                  <span className="text-xs text-[#7a8591]">Watching for pairing requests...</span>
+                </div>
+              </div>
+            )}
+          </div>
+
+          {/* Footer */}
+          {wizard.step === "setup" && (
+            <div className="flex shrink-0 items-center justify-between gap-3 border-t border-[#2c343d] px-5 py-4">
+              {meta?.docsUrl ? (
+                <a
+                  href={meta.docsUrl}
+                  target="_blank"
+                  rel="noopener noreferrer"
+                  className="inline-flex items-center gap-1.5 text-xs text-[#7a8591] underline-offset-2 hover:text-[#a8b0ba] hover:underline"
+                >
+                  <ExternalLink className="h-3 w-3" />
+                  Official docs
+                </a>
+              ) : (
+                <span />
+              )}
+              <button
+                type="button"
+                onClick={() => void handleConnect()}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#34d399] px-5 text-sm font-medium text-[#101214] transition-colors hover:bg-[#6ee7b7]"
+              >
+                {meta?.usesQr ? (
+                  <>
+                    <QrCode className="h-4 w-4" />
+                    Open QR scanner
+                  </>
+                ) : (
+                  <>
+                    Connect
+                    <ChevronRight className="h-4 w-4" />
+                  </>
+                )}
+              </button>
+            </div>
+          )}
+
+          {wizard.step === "connected" && (
+            <div className="flex shrink-0 items-center justify-end gap-2 border-t border-[#2c343d] px-5 py-4">
+              <button
+                type="button"
+                onClick={handleDone}
+                className="inline-flex h-9 items-center gap-2 rounded-lg border border-[#2c343d] bg-[#15191d] px-4 text-sm font-medium text-[#a8b0ba] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa]"
+              >
+                Done
+              </button>
+              <button
+                type="button"
+                onClick={proceedToWaiting}
+                className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#34d399] px-5 text-sm font-medium text-[#101214] transition-colors hover:bg-[#6ee7b7]"
+              >
+                <Bell className="h-4 w-4" />
+                Watch for requests
+              </button>
+            </div>
+          )}
+
+          {wizard.step === "waiting" && (
+            <div className="shrink-0 border-t border-[#2c343d] px-5 py-4">
+              <button
+                type="button"
+                onClick={onClose}
+                className="inline-flex h-9 w-full items-center justify-center rounded-lg border border-[#2c343d] bg-[#15191d] text-sm font-medium text-[#a8b0ba] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa]"
+              >
+                Close — I'll check back later
+              </button>
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* QR modal rendered on top */}
+      {showQr && wizard.channelId === "whatsapp" && (
+        <QrLoginModal
+          channel="whatsapp"
+          onSuccess={handleQrSuccess}
+          onClose={() => setShowQr(false)}
+        />
+      )}
+    </>
+  );
+}
+
+/* ── Pairing request card ────────────────────────── */
+
+function PairingCard({
+  request,
+  onApprove,
+  approving,
+}: {
+  request: PairingRequest;
+  onApprove: () => void;
+  approving: boolean;
+}) {
+  const channelId = (request.channel as ChannelId) in CHANNEL_META
+    ? (request.channel as ChannelId)
+    : "telegram";
+  const meta = CHANNEL_META[channelId];
+
+  return (
+    <div className="animate-enter flex items-start gap-3 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+      <div
+        className={cn(
+          "mt-0.5 flex h-8 w-8 shrink-0 items-center justify-center rounded-lg border [&_svg]:h-4 [&_svg]:w-4",
+          meta.bgColor,
+          meta.color,
+          meta.borderColor
+        )}
+      >
+        {meta.icon}
+      </div>
+      <div className="min-w-0 flex-1">
+        <div className="flex flex-wrap items-center gap-1.5">
+          <span className="text-xs font-semibold text-[#f5f7fa]">
+            {request.senderName ?? request.senderId ?? "Someone new"}
+          </span>
+          <span className="rounded-full border border-amber-500/20 bg-amber-500/10 px-1.5 py-0.5 text-[10px] font-medium text-amber-400">
+            Wants to connect
+          </span>
+        </div>
+        {request.message && (
+          <p className="mt-1 truncate text-xs text-[#7a8591]">
+            &ldquo;{request.message}&rdquo;
+          </p>
+        )}
+        {request.account && (
+          <p className="mt-0.5 text-[11px] text-[#7a8591]">via {request.account}</p>
+        )}
+      </div>
+      <button
+        type="button"
+        onClick={onApprove}
+        disabled={approving}
+        className="ml-2 inline-flex h-8 shrink-0 items-center gap-1.5 rounded-lg bg-[#34d399] px-3 text-xs font-medium text-[#101214] transition-colors hover:bg-[#6ee7b7] disabled:opacity-60"
+      >
+        {approving ? (
+          <Loader2 className="h-3 w-3 animate-spin" />
+        ) : (
+          <UserCheck className="h-3 w-3" />
+        )}
+        Approve
+      </button>
+    </div>
+  );
+}
+
+/* ── Channel card ────────────────────────────────── */
+
+function ChannelCard({
+  channel,
+  pairingCount,
+  onConnect,
+  onDisconnect,
+}: {
+  channel: Channel;
+  pairingCount: number;
+  onConnect: () => void;
+  onDisconnect: () => void;
+}) {
+  const channelId =
+    channel.id in CHANNEL_META ? (channel.id as ChannelId) : null;
+  const meta = channelId ? CHANNEL_META[channelId] : null;
+  const [confirming, setConfirming] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
+  const confirmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  async function handleDisconnect() {
+    if (!confirming) {
+      setConfirming(true);
+      confirmTimer.current = setTimeout(() => setConfirming(false), 3000);
+      return;
+    }
+    if (confirmTimer.current) clearTimeout(confirmTimer.current);
+    setDisconnecting(true);
+    try {
+      await fetch("/api/channels", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "disconnect", channel: channel.id }),
+      });
+      onDisconnect();
+    } finally {
+      setDisconnecting(false);
+      setConfirming(false);
+    }
+  }
+
+  if (!meta || !channelId) return null;
+
+  return (
+    <div
+      className={cn(
+        "group relative flex flex-col gap-4 rounded-xl border p-5 transition-all",
+        channel.connected
+          ? "border-[#2c343d] bg-[#15191d]"
+          : "border-[#2c343d]/50 bg-[#15191d]/50"
+      )}
+    >
+      {/* Top row */}
+      <div className="flex items-start gap-3">
+        <ChannelIcon channelId={channelId} size="md" />
+        <div className="min-w-0 flex-1">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-semibold text-[#f5f7fa]">{channel.label}</span>
+            {pairingCount > 0 && (
+              <span className="flex h-4 min-w-4 items-center justify-center rounded-full bg-amber-500/20 px-1 text-[10px] font-bold text-amber-400 ring-1 ring-amber-500/30">
+                {pairingCount}
+              </span>
+            )}
+          </div>
+          <div className="mt-1 flex items-center gap-1.5">
+            <StatusDot connected={channel.connected} />
+            <span
+              className={cn(
+                "text-xs",
+                channel.connected ? "text-emerald-400" : "text-[#7a8591]"
+              )}
+            >
+              {channel.connected ? "Connected" : "Not connected"}
+            </span>
+          </div>
+        </div>
+
+        {/* Actions */}
+        {channel.connected ? (
+          <div className="flex items-center gap-1 opacity-0 transition-opacity group-hover:opacity-100">
+            <button
+              type="button"
+              title="Settings"
+              className="flex h-7 w-7 items-center justify-center rounded-lg text-[#7a8591] transition-colors hover:bg-[#20252a] hover:text-[#a8b0ba]"
+            >
+              <Settings className="h-3.5 w-3.5" />
+            </button>
+            <button
+              type="button"
+              title={confirming ? "Click again to confirm disconnect" : "Disconnect"}
+              onClick={() => void handleDisconnect()}
+              disabled={disconnecting}
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded-lg transition-all",
+                confirming
+                  ? "bg-red-500/15 text-red-400 opacity-100 ring-1 ring-red-500/30"
+                  : "text-[#7a8591] hover:bg-red-500/10 hover:text-red-400"
+              )}
+            >
+              {disconnecting ? (
+                <Loader2 className="h-3.5 w-3.5 animate-spin" />
+              ) : (
+                <Trash2 className="h-3.5 w-3.5" />
+              )}
+            </button>
+          </div>
+        ) : (
+          <button
+            type="button"
+            onClick={onConnect}
+            className="inline-flex h-7 items-center gap-1.5 rounded-lg border border-[#2c343d] bg-[#20252a] px-2.5 text-xs font-medium text-[#a8b0ba] transition-colors hover:border-[#34d399]/30 hover:bg-[#34d399]/10 hover:text-[#34d399]"
+          >
+            <Plus className="h-3.5 w-3.5" />
+            Connect
+          </button>
+        )}
+      </div>
+
+      {/* Error */}
+      {channel.error && (
+        <div className="flex items-start gap-2 rounded-lg border border-red-500/20 bg-red-500/5 px-3 py-2">
+          <AlertCircle className="mt-0.5 h-3.5 w-3.5 shrink-0 text-red-400" />
+          <p className="text-xs text-red-400">{channel.error}</p>
+        </div>
+      )}
+
+      {/* Pairing pending */}
+      {channel.connected && pairingCount > 0 && (
+        <div className="flex items-center gap-2 rounded-lg border border-amber-500/20 bg-amber-500/5 px-3 py-2">
+          <Bell className="h-3.5 w-3.5 shrink-0 text-amber-400" />
+          <p className="text-xs text-amber-400">
+            {pairingCount === 1
+              ? "1 pairing request needs your approval"
+              : `${pairingCount} pairing requests need your approval`}
+          </p>
+        </div>
+      )}
+
+      {/* Idle connected */}
+      {channel.connected && pairingCount === 0 && !channel.error && (
+        <div className="flex items-center gap-2 text-[11px] text-[#7a8591]">
+          <Zap className="h-3 w-3 text-[#3d4752]" />
+          Ready — watching for incoming messages
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ── Main view ───────────────────────────────────── */
+
+export function ChannelsView() {
+  const [channels, setChannels] = useState<Channel[]>([]);
+  const [pairingRequests, setPairingRequests] = useState<PairingRequest[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+  const [showWizard, setShowWizard] = useState(false);
+  const [approvingCode, setApprovingCode] = useState<string | null>(null);
+  const [recentlyConnected, setRecentlyConnected] = useState<string | null>(null);
+
+  const fetchChannels = useCallback(async () => {
+    try {
+      const res = await fetch("/api/channels");
+      if (!res.ok) throw new Error("Failed to load channels");
+      const data: { channels: Channel[] } = await res.json();
+      setChannels(data.channels ?? []);
+      setFetchError(null);
+    } catch (e) {
+      setFetchError(e instanceof Error ? e.message : "Failed to load channels");
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  const fetchPairing = useCallback(async () => {
+    try {
+      const res = await fetch("/api/pairing");
+      if (!res.ok) return;
+      const data: { dm: PairingRequest[] } = await res.json();
+      setPairingRequests(data.dm ?? []);
+    } catch {
+      // Non-critical — silent fail
+    }
+  }, []);
+
+  useSmartPoll(fetchChannels, { intervalMs: 15000, immediate: true });
+  useSmartPoll(fetchPairing, { intervalMs: 5000, immediate: true });
+
+  async function handleApprove(request: PairingRequest) {
+    setApprovingCode(request.code);
+    try {
+      await fetch("/api/pairing", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "approve-dm",
+          channel: request.channel,
+          code: request.code,
+          account: request.account,
+        }),
+      });
+      setPairingRequests((prev) => prev.filter((r) => r.code !== request.code));
+    } finally {
+      setApprovingCode(null);
+    }
+  }
+
+  function handleConnected(channelId: string) {
+    setRecentlyConnected(channelId);
+    void fetchChannels();
+    void fetchPairing();
+    setTimeout(() => setRecentlyConnected(null), 5000);
+  }
+
+  const connectedCount = channels.filter((c) => c.connected).length;
+  const pendingCount = pairingRequests.length;
+
+  function getPairingCount(channelId: string) {
+    return pairingRequests.filter((r) => r.channel === channelId).length;
   }
 
   return (
     <SectionLayout>
-      <SectionBody width="narrow" padding="roomy" innerClassName="space-y-8">
-        <section>
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <div>
-              <h2 className="text-xs font-semibold text-foreground/90">Channels</h2>
-              <p className="mt-0.5 text-xs text-muted-foreground/70">
-                Connect and manage Discord, Telegram, WhatsApp, Slack, and more.
-              </p>
-            </div>
-            <div className="flex items-center gap-2">
-              <button
-                type="button"
-                onClick={() => {
-                  setChannelsLoading(true);
-                  void fetchChannels();
-                }}
-                disabled={busy || channelsLoading}
-                className="flex items-center gap-1 rounded-lg border border-foreground/10 bg-foreground/5 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/10 disabled:opacity-40"
-              >
-                {channelsLoading ? (
-                  <span className="inline-flex items-center gap-0.5">
-                    <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:0ms]" />
-                    <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:150ms]" />
-                    <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:300ms]" />
-                  </span>
-                ) : (
-                  <RefreshCw className="h-3 w-3" />
-                )}
-                Refresh
-              </button>
-              <button
-                type="button"
-                onClick={() => openWizard()}
-                className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-muted"
-              >
-                <Plus className="h-3.5 w-3.5" />
-                Add Channel
-              </button>
-            </div>
-          </div>
+      <SectionHeader
+        title="Messaging Channels"
+        description="Connect your AI assistant to messaging apps so people can talk to it."
+        meta={
+          connectedCount > 0
+            ? `${connectedCount} channel${connectedCount !== 1 ? "s" : ""} active`
+            : undefined
+        }
+        actions={
+          <button
+            type="button"
+            onClick={() => setShowWizard(true)}
+            className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#34d399] px-4 text-sm font-medium text-[#101214] transition-colors hover:bg-[#6ee7b7]"
+          >
+            <Plus className="h-4 w-4" />
+            Add channel
+          </button>
+        }
+        bordered
+      />
 
-          {wizardOpen && (
-            <div className="mb-4 rounded-xl border border-violet-500/20 bg-violet-500/5 p-4">
-              <div className="mb-3 flex items-center justify-between gap-2">
-                <div className="flex items-center gap-2">
-                  <Rocket className="h-4 w-4 text-violet-300" />
-                  <h3 className="text-sm font-semibold text-foreground/90">Channel Setup Wizard</h3>
+      <SectionBody width="narrow">
+        {loading ? (
+          <LoadingState label="Loading channels..." />
+        ) : fetchError ? (
+          <div className="flex flex-col items-center gap-4 py-16 text-center">
+            <div className="flex h-12 w-12 items-center justify-center rounded-xl border border-red-500/20 bg-red-500/10">
+              <WifiOff className="h-6 w-6 text-red-400" />
+            </div>
+            <div>
+              <p className="text-sm font-medium text-[#f5f7fa]">Could not load channels</p>
+              <p className="mt-1 text-xs text-[#7a8591]">{fetchError}</p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void fetchChannels()}
+              className="inline-flex items-center gap-2 rounded-lg border border-[#2c343d] bg-[#15191d] px-3 py-1.5 text-xs font-medium text-[#a8b0ba] transition-colors hover:bg-[#20252a]"
+            >
+              <RefreshCw className="h-3.5 w-3.5" />
+              Try again
+            </button>
+          </div>
+        ) : (
+          <div className="space-y-6">
+            {/* Pairing requests */}
+            {pendingCount > 0 && (
+              <section>
+                <div className="mb-3 flex items-center gap-2">
+                  <Bell className="h-4 w-4 text-amber-400" />
+                  <h2 className="text-sm font-semibold text-[#f5f7fa]">Pairing requests</h2>
+                  <span className="flex h-5 min-w-5 items-center justify-center rounded-full bg-amber-500/20 px-1.5 text-[11px] font-bold text-amber-400 ring-1 ring-amber-500/30">
+                    {pendingCount}
+                  </span>
+                </div>
+                <div className="space-y-2">
+                  {pairingRequests.map((req) => (
+                    <PairingCard
+                      key={`${req.channel}-${req.code}`}
+                      request={req}
+                      onApprove={() => void handleApprove(req)}
+                      approving={approvingCode === req.code}
+                    />
+                  ))}
+                </div>
+              </section>
+            )}
+
+            {/* Recently connected banner */}
+            {recentlyConnected && (
+              <div className="animate-enter flex items-center gap-3 rounded-xl border border-[#34d399]/20 bg-[#34d399]/5 px-4 py-3">
+                <Check className="h-4 w-4 shrink-0 text-[#34d399]" />
+                <p className="text-xs text-[#34d399]">
+                  {recentlyConnected.charAt(0).toUpperCase() + recentlyConnected.slice(1)} connected. Send your bot a message to get started.
+                </p>
+              </div>
+            )}
+
+            {/* Empty state */}
+            {channels.length === 0 ? (
+              <div className="flex flex-col items-center gap-6 py-16 text-center">
+                <div className="flex h-16 w-16 items-center justify-center rounded-2xl border border-[#2c343d] bg-[#15191d]">
+                  <MessageCircle className="h-8 w-8 text-[#3d4752]" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-[#f5f7fa]">No channels connected yet</p>
+                  <p className="mx-auto mt-1.5 max-w-xs text-xs leading-relaxed text-[#7a8591]">
+                    Connect Telegram, Discord, or WhatsApp so people can chat with your AI assistant directly from their favourite app.
+                  </p>
                 </div>
                 <button
                   type="button"
-                  onClick={() => setWizardOpen(false)}
-                  className="rounded-md px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground/80"
+                  onClick={() => setShowWizard(true)}
+                  className="inline-flex h-9 items-center gap-2 rounded-lg bg-[#34d399] px-5 text-sm font-medium text-[#101214] transition-colors hover:bg-[#6ee7b7]"
                 >
-                  Close
+                  <Plus className="h-4 w-4" />
+                  Add your first channel
                 </button>
               </div>
-
-              <div className="mb-3 flex items-center gap-2 text-xs">
-                {[1, 2, 3].map((step) => (
-                  <div key={step} className="flex items-center gap-2">
-                    <span
-                      className={cn(
-                        "flex h-5 w-5 items-center justify-center rounded-full border text-xs font-semibold",
-                        wizardStep >= step
-                          ? "border-violet-400/40 bg-violet-500/20 text-violet-200"
-                          : "border-foreground/10 bg-muted text-muted-foreground"
-                      )}
-                    >
-                      {step}
-                    </span>
-                    <span className="text-muted-foreground">
-                      {step === 1 ? "Choose" : step === 2 ? "Configure" : "Finish"}
-                    </span>
-                    {step < 3 && <span className="text-muted-foreground/40">→</span>}
-                  </div>
-                ))}
-              </div>
-
-              {wizardStep === 1 && (
-                <div className="space-y-3">
-                  <p className="text-xs text-muted-foreground">
-                    Pick a channel to connect. The wizard will guide you through required steps.
-                  </p>
-                  <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                    {channels.map((ch) => (
-                      <button
-                        key={ch.channel}
-                        type="button"
-                        onClick={() => setWizardChannel(ch.channel)}
-                        className={cn(
-                          "flex items-center justify-between rounded-lg border px-3 py-2 text-left transition-colors",
-                          wizardChannel === ch.channel
-                            ? "border-violet-500/30 bg-violet-500/10"
-                            : "border-foreground/10 bg-card/60 hover:bg-card"
-                        )}
-                      >
-                        <div className="flex min-w-0 items-center gap-2">
-                          <span className="text-xs">{ch.icon}</span>
-                          <div className="min-w-0">
-                            <p className="truncate text-xs font-medium text-foreground/90">{ch.label}</p>
-                            <p className="text-xs text-muted-foreground">
-                              {ch.setupType === "token"
-                                ? "Token setup"
-                                : ch.setupType === "qr"
-                                  ? "Interactive login"
-                                  : ch.setupType === "auto"
-                                    ? "Built in"
-                                    : "Manual setup"}
-                            </p>
-                          </div>
-                        </div>
-                        <span
-                          className={cn(
-                            "rounded-full px-2 py-0.5 text-xs font-medium",
-                            ch.configured
-                              ? "bg-emerald-500/15 text-emerald-300"
-                              : "bg-amber-500/15 text-amber-300"
-                          )}
-                        >
-                          {ch.configured ? "Configured" : "Needs setup"}
-                        </span>
-                      </button>
-                    ))}
-                  </div>
-                  <div className="flex justify-end">
-                    <button
-                      type="button"
-                      onClick={() => setWizardStep(2)}
-                      disabled={!selectedWizardChannel}
-                      className="inline-flex items-center gap-1 rounded-lg bg-primary text-primary-foreground px-3 py-1.5 text-xs font-medium transition-colors hover:bg-primary/90 disabled:opacity-40"
-                    >
-                      Next
-                      <Play className="h-3 w-3" />
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {wizardStep === 2 && selectedWizardChannel && (
-                <div className="space-y-3">
-                  <div className="rounded-lg border border-foreground/10 bg-card/70 p-3">
-                    <div className="flex items-center justify-between gap-2">
-                      <div className="flex items-center gap-2">
-                        <span className="text-xs">{selectedWizardChannel.icon}</span>
-                        <div>
-                          <p className="text-xs font-semibold text-foreground/90">{selectedWizardChannel.label}</p>
-                        </div>
-                      </div>
-                      {selectedWizardChannel.docsUrl && (
-                        <a
-                          href={selectedWizardChannel.docsUrl}
-                          target="_blank"
-                          rel="noreferrer"
-                          className="inline-flex items-center gap-1 rounded-md border border-foreground/10 bg-card px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-foreground/5 hover:text-foreground/80"
-                        >
-                          Docs
-                          <ExternalLink className="h-3 w-3" />
-                        </a>
-                      )}
-                    </div>
-                    <div className="mt-2 rounded-md border border-violet-500/25 bg-violet-500/10 px-3 py-2.5">
-                      <p className="text-sm font-medium leading-relaxed text-foreground/95">
-                        <LinkifiedText text={selectedWizardChannel.setupHint} />
-                      </p>
-                    </div>
-                    {selectedWizardChannel.setupCommand && (
-                      <div className="mt-2 rounded-md border border-foreground/10 bg-muted/60 px-2 py-1.5 font-mono text-xs text-muted-foreground">
-                        {selectedWizardChannel.setupCommand}
-                      </div>
-                    )}
-                    {selectedWizardChannel.configHint && (
-                      <p className="mt-2 text-xs leading-relaxed text-muted-foreground/90">
-                        <LinkifiedText text={selectedWizardChannel.configHint} />
-                      </p>
-                    )}
-                  </div>
-
-                  <div className="grid grid-cols-1 gap-2 md:grid-cols-2">
-                    {needsToken && (
-                      <label className="space-y-1 md:col-span-2">
-                        <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground/70">
-                          {selectedWizardChannel.tokenLabel || "Token"}
-                        </span>
-                        <input
-                          value={wizardToken}
-                          onChange={(e) => setWizardToken(e.target.value)}
-                          type="password"
-                          placeholder={selectedWizardChannel.tokenPlaceholder || "Paste token"}
-                          className="w-full rounded-md border border-foreground/10 bg-muted px-2.5 py-2 text-xs text-foreground/90 outline-none focus:border-violet-500/30"
-                        />
-                      </label>
-                    )}
-                    {requiresAppToken && (
-                      <label className="space-y-1 md:col-span-2">
-                        <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground/70">
-                          App Token
-                        </span>
-                        <input
-                          value={wizardAppToken}
-                          onChange={(e) => setWizardAppToken(e.target.value)}
-                          type="password"
-                          placeholder="xapp-..."
-                          className="w-full rounded-md border border-foreground/10 bg-muted px-2.5 py-2 text-xs text-foreground/90 outline-none focus:border-violet-500/30"
-                        />
-                      </label>
-                    )}
-                    {selectedWizardChannel.setupType !== "cli" && (
-                      <label className="space-y-1 md:col-span-2">
-                        <span className="text-xs font-medium uppercase tracking-wider text-muted-foreground/70">
-                          Account (optional)
-                        </span>
-                        <input
-                          value={wizardAccount}
-                          onChange={(e) => setWizardAccount(e.target.value)}
-                          placeholder="default"
-                          className="w-full rounded-md border border-foreground/10 bg-muted px-2.5 py-2 text-xs text-foreground/90 outline-none focus:border-violet-500/30"
-                        />
-                      </label>
-                    )}
-                  </div>
-
-                  {wizardError && (
-                    <div className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-2 text-xs text-red-300">
-                      {wizardError}
-                    </div>
-                  )}
-
-                  <div className="flex items-center justify-between">
-                    <button
-                      type="button"
-                      onClick={() => setWizardStep(1)}
-                      className="rounded-lg border border-foreground/10 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/5"
-                    >
-                      Back
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => void runWizardSetup()}
-                      disabled={!canRunWizard || wizardRunning}
-                      className="inline-flex items-center gap-1 rounded-lg bg-primary text-primary-foreground px-3 py-1.5 text-xs font-medium transition-colors hover:bg-primary/90 disabled:opacity-40"
-                    >
-                      {wizardRunning ? (
-                        <>
-                          <span className="inline-flex items-center gap-0.5">
-                            <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:0ms]" />
-                            <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:150ms]" />
-                            <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:300ms]" />
-                          </span>
-                          Running...
-                        </>
-                      ) : (
-                        <>
-                          <Plug className="h-3 w-3" />
-                          {selectedWizardChannel.setupType === "cli" ? "Continue" : "Run Setup"}
-                        </>
-                      )}
-                    </button>
-                  </div>
-                </div>
-              )}
-
-              {wizardStep === 3 && selectedWizardChannel && (
-                <div className="space-y-3">
-                  <div
-                    className={cn(
-                      "rounded-lg px-3 py-2 text-xs",
-                      selectedWizardChannel.setupType === "cli"
-                        ? "border border-amber-500/20 bg-amber-500/10 text-amber-200"
-                        : "border border-emerald-500/20 bg-emerald-500/10 text-emerald-200"
-                    )}
-                  >
-                    {selectedWizardChannel.setupType === "cli" ? (
-                      <>
-                        Manual setup required for <span className="font-semibold">{selectedWizardChannel.label}</span>.
-                        Follow the guide below, then return here to verify the channel status.
-                      </>
-                    ) : (
-                      <>
-                        Setup run completed for <span className="font-semibold">{selectedWizardChannel.label}</span>.
-                        {selectedWizardChannel.setupType === "qr" && " If interactive login is required, continue in Terminal."}
-                      </>
-                    )}
-                  </div>
-                  <div className="rounded-lg border border-foreground/10 bg-card/70 px-3 py-2.5">
-                    <p className="text-xs font-semibold text-foreground/90">
-                      What to do now
-                    </p>
-                    <ol className="mt-2 list-decimal space-y-1.5 pl-4 text-xs text-muted-foreground">
-                      {getPostSetupChecklist(selectedWizardChannel.channel).map((step, idx) => (
-                        <li key={`${selectedWizardChannel.channel}-post-step-${idx}`}>
-                          <span>
-                            <LinkifiedText text={step} />
-                          </span>
-                        </li>
-                      ))}
-                    </ol>
-                    {selectedWizardChannel.docsUrl && (
-                      <a
-                        href={selectedWizardChannel.docsUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="mt-2 inline-flex items-center gap-1 text-xs text-violet-300 transition-colors hover:text-violet-200"
-                      >
-                        Open channel docs
-                        <ExternalLink className="h-3 w-3" />
-                      </a>
-                    )}
-                  </div>
-                  {wizardOutput && (
-                    <pre className="max-h-40 overflow-auto rounded-lg border border-foreground/10 bg-card px-3 py-2 text-xs text-muted-foreground whitespace-pre-wrap">
-                      {wizardOutput}
-                    </pre>
-                  )}
-                  <div className="flex items-center justify-between">
-                    <button
-                      type="button"
-                      onClick={() => setWizardStep(2)}
-                      className="rounded-lg border border-foreground/10 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/5"
-                    >
-                      Reconfigure
-                    </button>
-                    <div className="flex items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => openWizard()}
-                        className="rounded-lg border border-foreground/10 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/5"
-                      >
-                        Setup Another
-                      </button>
-                      {selectedWizardChannel.setupType === "cli" ? (
-                        selectedWizardChannel.docsUrl ? (
-                          <a
-                            href={selectedWizardChannel.docsUrl}
-                            target="_blank"
-                            rel="noreferrer"
-                            className="inline-flex items-center gap-1 rounded-lg bg-primary px-3 py-1.5 text-xs font-medium text-primary-foreground transition-colors hover:bg-primary/90"
-                          >
-                            Open Setup Guide
-                            <ExternalLink className="h-3 w-3" />
-                          </a>
-                        ) : null
-                      ) : (
-                        <Link
-                          href="/terminal"
-                          className="inline-flex items-center gap-1 rounded-lg bg-primary text-primary-foreground px-3 py-1.5 text-xs font-medium transition-colors hover:bg-primary/90"
-                        >
-                          Open Terminal
-                        </Link>
-                      )}
-                    </div>
-                  </div>
-                </div>
-              )}
-            </div>
-          )}
-
-          <div className="space-y-3">
-            {channels.map((ch) => (
-              <div
-                key={ch.channel}
-                className="rounded-xl border border-foreground/10 bg-card/90 p-4"
-              >
-                <div className="flex items-center gap-3">
-                  <span className="text-xs">{ch.icon}</span>
-                  <div>
-                    <p className="text-xs font-semibold text-foreground">{ch.label}</p>
-                    <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                      <span className="flex items-center gap-1">
-                        {ch.enabled ? (
-                          <Check className="h-3 w-3 text-emerald-400" />
-                        ) : (
-                          <X className="h-3 w-3 text-red-400" />
-                        )}
-                        {ch.enabled ? "Enabled" : "Disabled"}
-                      </span>
-                      <span>{ch.configured ? "Configured" : "Not configured"}</span>
-                      <span className="capitalize">{ch.setupType} setup</span>
-                    </div>
-                  </div>
-                  <div className="ml-auto flex items-center gap-2">
-                    {ch.docsUrl && (
-                      <a
-                        href={ch.docsUrl}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 rounded-lg border border-foreground/10 bg-foreground/5 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/10 hover:text-foreground/80"
-                      >
-                        Docs
-                        <ExternalLink className="h-3 w-3" />
-                      </a>
-                    )}
-                    <button
-                      type="button"
-                      onClick={() => openWizard(ch.channel)}
-                      className="inline-flex items-center gap-1 rounded-lg border border-border bg-card px-2.5 py-1.5 text-xs text-foreground transition-colors hover:bg-muted"
-                    >
-                      {ch.configured ? "Reconfigure" : "Setup"}
-                    </button>
-                    {ch.configured && (
-                      <button
-                        type="button"
-                        onClick={() =>
-                          void runChannelAction(
-                            { action: ch.enabled ? "disable" : "enable", channel: ch.channel },
-                            `${ch.label} ${ch.enabled ? "disabled" : "enabled"}`
-                          )
-                        }
-                        disabled={busy}
-                        className="rounded-lg border border-foreground/10 bg-foreground/5 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-foreground/10 disabled:opacity-40"
-                      >
-                        {ch.enabled ? "Disable" : "Enable"}
-                      </button>
-                    )}
-                  </div>
-                </div>
-
-                <div className="mt-3 flex flex-wrap gap-2">
-                  {ch.accounts.map((acc) => (
-                    <span
-                      key={acc}
-                      className="rounded-md border border-foreground/10 bg-muted/70 px-2.5 py-1 text-xs text-muted-foreground"
-                    >
-                      {acc}
-                    </span>
-                  ))}
-                  {ch.accounts.length === 0 && (
-                    <span className="rounded-md border border-foreground/10 bg-muted/60 px-2.5 py-1 text-xs text-muted-foreground/70">
-                      No accounts connected yet
-                    </span>
-                  )}
-                </div>
-
-                {ch.statuses.length > 0 && (
-                  <div className="mt-2 flex flex-wrap gap-2">
-                    {ch.statuses.map((status) => (
-                      <span
-                        key={`${status.channel}:${status.account}:${status.status}`}
-                        className={cn(
-                          "rounded-full border border-foreground/10 bg-foreground/5 px-2 py-0.5 text-xs",
-                          statusTone(status.status)
-                        )}
-                        title={status.error || status.status}
-                      >
-                        {status.account || "default"} · {status.status}
-                      </span>
-                    ))}
-                  </div>
-                )}
-
-                {ch.configured && (
-                  <button
-                    type="button"
-                    onClick={() => toggleChannelExpanded(ch.channel)}
-                    className="mt-2 flex items-center gap-1 text-xs text-muted-foreground/70 transition-colors hover:text-foreground/80"
-                  >
-                    <ChevronDown
-                      className={cn(
-                        "h-3 w-3 transition-transform",
-                        expandedChannels.has(ch.channel) && "rotate-180"
-                      )}
+            ) : (
+              <section>
+                <h2 className="mb-3 text-xs font-semibold uppercase tracking-widest text-[#7a8591]">
+                  Your channels
+                </h2>
+                <div className="stagger-cards grid grid-cols-1 gap-3 sm:grid-cols-2 lg:grid-cols-3">
+                  {channels.map((ch) => (
+                    <ChannelCard
+                      key={ch.id}
+                      channel={ch}
+                      pairingCount={getPairingCount(ch.id)}
+                      onConnect={() => setShowWizard(true)}
+                      onDisconnect={() => void fetchChannels()}
                     />
-                    Channel Settings
-                  </button>
-                )}
+                  ))}
+                </div>
+              </section>
+            )}
 
-                {expandedChannels.has(ch.channel) && ch.configured && (
-                  <div className="mt-3 rounded-lg border border-foreground/10 bg-muted/30 p-3 space-y-3">
-                    <div className="flex flex-wrap items-center gap-4">
-                      <label className="flex items-center gap-2 text-xs">
-                        <Shield className="h-3 w-3 text-muted-foreground" />
-                        <span className="text-muted-foreground">DM Policy</span>
-                        <select
-                          value={ch.dmPolicy || "pairing"}
-                          onChange={(e) =>
-                            void setChannelPolicy(ch.channel, "dmPolicy", e.target.value)
-                          }
-                          disabled={busy}
-                          className="rounded border border-foreground/10 bg-background px-2 py-1 text-xs"
-                        >
-                          <option value="pairing">Pairing (approve first)</option>
-                          <option value="allow">Allow all</option>
-                          <option value="deny">Deny all</option>
-                        </select>
-                      </label>
-                      <label className="flex items-center gap-2 text-xs">
-                        <Shield className="h-3 w-3 text-muted-foreground" />
-                        <span className="text-muted-foreground">Group Policy</span>
-                        <select
-                          value={ch.groupPolicy || "allow"}
-                          onChange={(e) =>
-                            void setChannelPolicy(ch.channel, "groupPolicy", e.target.value)
-                          }
-                          disabled={busy}
-                          className="rounded border border-foreground/10 bg-background px-2 py-1 text-xs"
-                        >
-                          <option value="allow">Allow all</option>
-                          <option value="mention">Mention only</option>
-                          <option value="deny">Deny all</option>
-                        </select>
-                      </label>
-                    </div>
-                    <p className="text-xs text-muted-foreground/60">
-                      DM Policy controls who can message the bot directly. Group Policy controls how the bot responds in group chats.
-                    </p>
-                  </div>
-                )}
-
-                {ch.setupHint && !expandedChannels.has(ch.channel) && (
-                  <p className="mt-2 text-xs text-muted-foreground/70">
-                    <LinkifiedText text={ch.setupHint} />
-                  </p>
-                )}
+            {/* How it works — shown when channels exist but none are connected */}
+            {channels.length > 0 && connectedCount === 0 && (
+              <div className="rounded-xl border border-[#2c343d] bg-[#15191d] p-5">
+                <div className="mb-3 flex items-center gap-2">
+                  <BotMessageSquare className="h-4 w-4 text-[#34d399]" />
+                  <span className="text-xs font-semibold text-[#d6dce3]">How it works</span>
+                </div>
+                <ol className="space-y-3">
+                  {[
+                    "Connect a channel using the Connect button on any card above.",
+                    "Send your bot its first message from that app.",
+                    "Approve the pairing request here — then that person can chat with your AI.",
+                  ].map((text, i) => (
+                    <li key={i} className="flex items-start gap-3">
+                      <StepNumber n={i + 1} />
+                      <p className="pt-0.5 text-xs leading-relaxed text-[#a8b0ba]">{text}</p>
+                    </li>
+                  ))}
+                </ol>
               </div>
-            ))}
-
-            {channels.length === 0 && (
-              <p className="text-sm text-muted-foreground/60">No channels found</p>
             )}
           </div>
-        </section>
-
-        {/* ── Pending Pairings ── */}
-        {(dmPairings.length > 0 || devicePairings.length > 0) && (
-          <section>
-            <div className="mb-3 flex items-center gap-2">
-              <Bell className="h-4 w-4 text-amber-400" />
-              <h2 className="text-xs font-semibold text-foreground/90">Pending Pairings</h2>
-              <span className="rounded-full bg-amber-500/15 px-2 py-0.5 text-xs font-medium text-amber-300">
-                {dmPairings.length + devicePairings.length}
-              </span>
-            </div>
-
-            {dmPairings.length > 0 && (
-              <div className="space-y-2">
-                <p className="text-xs text-muted-foreground/70">
-                  New contacts waiting for approval to message your bot.
-                </p>
-                {dmPairings.map((req) => (
-                  <div
-                    key={`${req.channel}:${req.code}`}
-                    className="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/5 p-3"
-                  >
-                    <div className="min-w-0">
-                      <p className="text-xs font-medium text-foreground">
-                        {req.senderName || req.senderId || "Unknown"}{" "}
-                        <span className="text-muted-foreground">on {req.channel}</span>
-                      </p>
-                      {req.message && (
-                        <p className="mt-0.5 truncate text-xs text-muted-foreground/70">
-                          &ldquo;{req.message}&rdquo;
-                        </p>
-                      )}
-                      <p className="mt-0.5 text-xs text-muted-foreground/50">
-                        Code: {req.code}
-                      </p>
-                    </div>
-                    <button
-                      type="button"
-                      onClick={() => void approveDmPairing(req.channel, req.code)}
-                      disabled={pairingBusy === `dm:${req.channel}:${req.code}`}
-                      className="ml-3 shrink-0 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
-                    >
-                      {pairingBusy === `dm:${req.channel}:${req.code}` ? "Approving..." : "Approve"}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {devicePairings.length > 0 && (
-              <div className="mt-3 space-y-2">
-                <p className="text-xs text-muted-foreground/70">
-                  Devices requesting access to your OpenClaw instance.
-                </p>
-                {devicePairings.map((req) => (
-                  <div
-                    key={req.requestId}
-                    className="flex items-center justify-between rounded-lg border border-amber-500/20 bg-amber-500/5 p-3"
-                  >
-                    <div className="min-w-0">
-                      <p className="text-xs font-medium text-foreground">
-                        {req.displayName || req.requestId}
-                      </p>
-                      <p className="mt-0.5 text-xs text-muted-foreground/70">
-                        {req.platform && `${req.platform} · `}
-                        {req.role || (req.roles || []).join(", ") || "user"}
-                      </p>
-                    </div>
-                    <div className="ml-3 flex shrink-0 items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => void handleDeviceAction("approve", req.requestId)}
-                        disabled={pairingBusy === `device:approve:${req.requestId}`}
-                        className="rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-medium text-white transition-colors hover:bg-emerald-500 disabled:opacity-50"
-                      >
-                        Approve
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => void handleDeviceAction("reject", req.requestId)}
-                        disabled={pairingBusy === `device:reject:${req.requestId}`}
-                        className="rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                      >
-                        Reject
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </section>
         )}
+      </SectionBody>
 
-        {/* ── Paired Devices ── */}
-        {pairedDevices.length > 0 && (
-          <section>
-            <div className="mb-3 flex items-center gap-2">
-              <Monitor className="h-4 w-4 text-muted-foreground" />
-              <h2 className="text-xs font-semibold text-foreground/90">Paired Devices</h2>
-            </div>
-            <div className="space-y-2">
-              {pairedDevices.map((device) => (
-                <div
-                  key={device.deviceId}
-                  className="flex items-center justify-between rounded-lg border border-foreground/10 bg-card/90 p-3"
-                >
-                  <div className="min-w-0">
-                    <p className="text-xs font-medium text-foreground">
-                      {device.displayName || device.deviceId}
-                    </p>
-                    <p className="mt-0.5 text-xs text-muted-foreground/70">
-                      {device.platform} · {device.role}{" "}
-                      {device.approvedAtMs > 0 && (
-                        <span>
-                          · approved {new Date(device.approvedAtMs).toLocaleDateString()}
-                        </span>
-                      )}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() =>
-                      void handleDeviceAction("revoke", device.deviceId, device.role)
-                    }
-                    disabled={pairingBusy === `device:revoke:${device.deviceId}`}
-                    className="ml-3 shrink-0 rounded-lg border border-red-500/30 bg-red-500/10 px-3 py-1.5 text-xs font-medium text-red-300 transition-colors hover:bg-red-500/20 disabled:opacity-50"
-                  >
-                    Revoke
-                  </button>
-                </div>
-              ))}
-            </div>
-          </section>
-        )}
-
-      {toast && (
-        <div
-          className={cn(
-            "fixed bottom-6 right-6 z-50 flex items-center gap-2 rounded-lg border px-4 py-2.5 text-xs shadow-xl backdrop-blur-sm",
-            toast.type === "success"
-              ? "border-emerald-500/20 bg-emerald-500/10 text-emerald-300"
-              : "border-red-500/20 bg-red-500/10 text-red-300"
-          )}
-        >
-          {toast.type === "success" ? (
-            <Check className="h-3.5 w-3.5" />
-          ) : (
-            <AlertTriangle className="h-3.5 w-3.5" />
-          )}
-          {toast.message}
-        </div>
-      )}
-      {/* QR Login Modal for WhatsApp */}
-      {qrModalOpen && (
-        <QrLoginModal
-          channel={qrChannel}
-          account={wizardAccount || undefined}
-          onSuccess={() => {
-            setQrModalOpen(false);
-            void fetchChannels();
-            flash("WhatsApp login successful");
-          }}
-          onClose={() => setQrModalOpen(false)}
+      {showWizard && (
+        <AddChannelWizard
+          onClose={() => setShowWizard(false)}
+          onConnected={handleConnected}
         />
       )}
-      </SectionBody>
     </SectionLayout>
   );
 }

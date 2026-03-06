@@ -7,6 +7,8 @@ type UseSmartPollOptions = {
   intervalMs?: number;
   /** When true, polling pauses (SSE/WS is providing data). */
   sseActive?: boolean;
+  /** When false, polling is disabled entirely. Default true. */
+  enabled?: boolean;
   /** Fire immediately on mount. Default true. */
   immediate?: boolean;
 };
@@ -22,7 +24,7 @@ export function useSmartPoll(
   fn: () => void | Promise<void>,
   options: UseSmartPollOptions = {},
 ) {
-  const { intervalMs = 5000, sseActive = false, immediate = true } = options;
+  const { intervalMs = 5000, sseActive = false, enabled = true, immediate = true } = options;
 
   const fnRef = useRef(fn);
   fnRef.current = fn;
@@ -32,6 +34,7 @@ export function useSmartPoll(
 
   const tick = useCallback(async () => {
     if (inFlight.current) return;
+    if (!enabled) return;
     if (document.visibilityState !== "visible") return;
     if (sseRef.current) return;
     inFlight.current = true;
@@ -44,12 +47,14 @@ export function useSmartPoll(
 
   // Fire immediately on mount only (not on intervalMs changes)
   useEffect(() => {
+    if (!enabled) return;
     if (immediate) void tick();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [enabled]);
 
   // Set up interval + visibility/focus listeners (re-runs when intervalMs changes)
   useEffect(() => {
+    if (!enabled) return;
     const id = window.setInterval(() => void tick(), intervalMs);
 
     const onVisible = () => {
@@ -65,5 +70,5 @@ export function useSmartPoll(
       document.removeEventListener("visibilitychange", onVisible);
       window.removeEventListener("focus", onFocus);
     };
-  }, [tick, intervalMs]);
+  }, [enabled, tick, intervalMs]);
 }

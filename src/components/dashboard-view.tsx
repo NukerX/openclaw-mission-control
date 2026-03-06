@@ -842,7 +842,7 @@ export function DashboardView() {
       title: "No messaging channels connected",
       detail: "Connect Telegram, WhatsApp, or another channel to receive agent messages.",
       fixLabel: "Setup Channel",
-      fixHref: "/agents",
+      fixHref: "/channels",
     });
   }
 
@@ -1014,6 +1014,37 @@ export function DashboardView() {
               </div>
             </div>
           </div>
+
+          {/* ── Pairing Request Banner ──────────────────── */}
+          {(pairingSummary?.total ?? 0) > 0 && (
+            <div className="rounded-xl border border-amber-400/30 bg-amber-500/10 p-4 shadow-sm">
+              <div className="flex items-center gap-3">
+                <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-500/20">
+                  <Bell className="h-5 w-5 text-amber-400" />
+                </div>
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-stone-900 dark:text-[#f5f7fa]">
+                    {pairingSummary?.total === 1
+                      ? "1 pairing request waiting for approval"
+                      : `${pairingSummary?.total} pairing requests waiting for approval`}
+                  </p>
+                  <p className="mt-0.5 text-xs text-stone-600 dark:text-[#a8b0ba]">
+                    Someone messaged your bot — approve the request so your AI can reply.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => {
+                    const bell = document.querySelector("[data-notification-bell]");
+                    if (bell instanceof HTMLElement) bell.click();
+                  }}
+                  className="shrink-0 rounded-lg bg-amber-500 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-amber-600"
+                >
+                  Review &amp; Approve
+                </button>
+              </div>
+            </div>
+          )}
 
           {/* ── Top Issues Now ─────────────────────────── */}
           {issues.length > 0 && (

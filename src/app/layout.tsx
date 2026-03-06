@@ -21,6 +21,8 @@ const geistMono = Geist_Mono({
   subsets: ["latin"],
 });
 
+const isHosted = process.env.AGENTBAY_HOSTED === "true";
+
 export const metadata: Metadata = {
   title: "Mission Control — OpenClaw GUI Dashboard for Local AI Agents",
   description:
@@ -45,7 +47,7 @@ export const metadata: Metadata = {
     "LLM management tool",
     "private AI",
   ],
-  manifest: "/manifest.json",
+  manifest: isHosted ? undefined : "/manifest.json",
   applicationName: "Mission Control",
   authors: [{ name: "OpenClaw" }],
   creator: "OpenClaw",
@@ -114,8 +116,8 @@ export default function RootLayout({
             </div>
             <AgentChatPanel />
             <ChatNotificationToast />
-            {process.env.AGENTBAY_HOSTED !== "true" && <OpenClawUpdateBanner />}
-            <UsageAlertMonitor />
+            {!isHosted && <OpenClawUpdateBanner />}
+            {!isHosted && <UsageAlertMonitor />}
           </SetupGate>
         </ThemeProvider>
       </body>

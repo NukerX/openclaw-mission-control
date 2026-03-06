@@ -38,6 +38,45 @@ export function getOpenClawHome(): string {
   return _home;
 }
 
+/**
+ * Returns the path to the active openclaw.json config file.
+ *
+ * The gateway writes its config to $OPENCLAW_HOME/.openclaw/openclaw.json (nested).
+ * The outer $OPENCLAW_HOME/openclaw.json may only contain the bootstrap env var dump.
+ * We check the nested path first; if it exists, prefer it.
+ */
+let _configPath: string | null = null;
+export function getConfigPath(): string {
+  if (_configPath) return _configPath;
+  const home = getOpenClawHome();
+  const nested = join(home, ".openclaw", "openclaw.json");
+  const outer = join(home, "openclaw.json");
+  try {
+    require("fs").accessSync(nested);
+    _configPath = nested;
+  } catch {
+    _configPath = outer;
+  }
+  return _configPath;
+}
+
+/**
+ * Read the merged openclaw.json config from both nested and outer paths.
+ * Nested config takes priority (it's what the gateway manages).
+ */
+export async function readConfigFile(): Promise<Record<string, unknown>> {
+  const { readFile } = await import("fs/promises");
+  const home = getOpenClawHome();
+  const nested = join(home, ".openclaw", "openclaw.json");
+  const outer = join(home, "openclaw.json");
+  let nestedCfg: Record<string, unknown> = {};
+  let outerCfg: Record<string, unknown> = {};
+  try { nestedCfg = JSON.parse(await readFile(nested, "utf-8")); } catch { /* */ }
+  try { outerCfg = JSON.parse(await readFile(outer, "utf-8")); } catch { /* */ }
+  // Nested takes priority — merge outer as baseline
+  return { ...outerCfg, ...nestedCfg };
+}
+
 // ── Default workspace directory ──────────────────
 
 let _workspace: string | null = null;

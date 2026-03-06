@@ -11,6 +11,7 @@ export const dynamic = "force-dynamic";
 type DmRequest = {
   channel: string;
   code: string;
+  account?: string;
   senderId?: string;
   senderName?: string;
   message?: string;
@@ -40,55 +41,88 @@ export async function GET() {
   const deviceRequests: DeviceRequest[] = [];
 
   // 1. Discover DM pairing channels by scanning credentials dir
-  try {
-    const credDir = join(home, "credentials");
-    const files = await readdir(credDir);
-    const pairingFiles = files.filter((f) => f.endsWith("-pairing.json"));
-
-    for (const file of pairingFiles) {
-      const channel = file.replace("-pairing.json", "");
-      try {
-        const raw = await readFile(join(credDir, file), "utf-8");
-        const data = JSON.parse(raw);
-        // data can be an array of requests or { requests: [...] }
-        const requests = Array.isArray(data)
-          ? data
-          : Array.isArray(data.requests)
-          ? data.requests
-          : [];
-
-        for (const req of requests) {
-          dmRequests.push({
-            ...req,
-            channel,
-            code: req.code || req.pairingCode || "",
-          });
-        }
-      } catch {
-        // File may be empty or malformed
-      }
-    }
-  } catch {
-    // credentials dir may not exist
-  }
-
-  // Also try the CLI for a more authoritative list (telegram is the most common)
-  const cliChannels = ["telegram", "whatsapp", "discord", "slack", "signal"];
-  for (const ch of cliChannels) {
+  // The gateway stores state in $OPENCLAW_HOME/.openclaw/ (nested), so check both paths.
+  const credDirs = [join(home, "credentials"), join(home, ".openclaw", "credentials")];
+  for (const credDir of credDirs) {
     try {
-      const data = await runCliJson<{ channel: string; requests: DmRequest[] }>(
-        ["pairing", "list", ch],
-        8000
-      );
-      for (const req of data.requests || []) {
-        // Avoid duplicates (match by code)
-        const code = req.code || "";
-        if (code && !dmRequests.some((d) => d.code === code && d.channel === ch)) {
-          dmRequests.push({ ...req, channel: ch, code });
+      const files = await readdir(credDir);
+      const pairingFiles = files.filter((f) => f.endsWith("-pairing.json"));
+
+      for (const file of pairingFiles) {
+        const channel = file.replace("-pairing.json", "");
+        try {
+          const raw = await readFile(join(credDir, file), "utf-8");
+          const data = JSON.parse(raw);
+          // data can be an array of requests or { requests: [...] }
+          const requests = Array.isArray(data)
+            ? data
+            : Array.isArray(data.requests)
+            ? data.requests
+            : [];
+
+          for (const req of requests) {
+            const code = req.code || req.pairingCode || "";
+            if (code && !dmRequests.some((d) => d.code === code && d.channel === channel)) {
+              // Normalize meta fields to top-level senderName for the frontend
+              const meta = req.meta || {};
+              const senderName =
+                req.senderName ||
+                [meta.firstName, meta.lastName].filter(Boolean).join(" ") ||
+                meta.username ||
+                undefined;
+              dmRequests.push({
+                ...req,
+                channel,
+                code,
+                account:
+                  typeof req.accountId === "string"
+                    ? req.accountId
+                    : typeof req.account === "string"
+                      ? req.account
+                      : undefined,
+                senderName,
+                senderId: req.senderId || req.id || meta.username || undefined,
+              });
+            }
+          }
+        } catch {
+          // File may be empty or malformed
         }
       }
     } catch {
-      // Channel not configured — skip silently
+      // credentials dir may not exist
+    }
+  }
+
+  // Also try the CLI for a more authoritative list (telegram is the most common)
+  const cliChannels = ["telegram", "whatsapp", "discord"];
+  const cliResults = await Promise.allSettled(
+    cliChannels.map(async (ch) => ({
+      channel: ch,
+      data: await runCliJson<{ channel: string; requests: DmRequest[] }>(
+        ["pairing", "list", ch],
+        2500
+      ),
+    }))
+  );
+  for (const result of cliResults) {
+    if (result.status !== "fulfilled") continue;
+    const ch = result.value.channel;
+    for (const req of result.value.data.requests || []) {
+      const code = req.code || "";
+      if (code && !dmRequests.some((d) => d.code === code && d.channel === ch)) {
+        dmRequests.push({
+          ...req,
+          channel: ch,
+          code,
+          account:
+            typeof req.accountId === "string"
+              ? req.accountId
+              : typeof req.account === "string"
+                ? req.account
+                : undefined,
+        });
+      }
     }
   }
 
@@ -121,17 +155,21 @@ export async function POST(request: NextRequest) {
       case "approve-dm": {
         const channel = body.channel as string;
         const code = body.code as string;
+        const account = body.account as string | undefined;
         if (!channel || !code) {
           return NextResponse.json(
             { error: "channel and code required" },
             { status: 400 }
           );
         }
+        const args = ["pairing", "approve", channel, code];
+        if (account && account.trim()) args.push("--account", account.trim());
+        args.push("--notify");
         const output = await runCli(
-          ["pairing", "approve", channel, code, "--notify"],
+          args,
           10000
         );
-        return NextResponse.json({ ok: true, action, channel, code, output });
+        return NextResponse.json({ ok: true, action, channel, code, account, output });
       }
 
       case "approve-device": {

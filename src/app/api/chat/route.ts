@@ -1,4 +1,3 @@
-import { gatewayCall } from "@/lib/openclaw";
 import { runOpenResponsesText, guessMime } from "@/lib/openresponses";
 import { getGatewayUrl, getGatewayToken } from "@/lib/paths";
 import { waitForResponsesEndpoint } from "@/app/api/gateway/route";
@@ -47,93 +46,12 @@ type Message = {
   content?: string;
 };
 
-type SessionsPatchResult = {
-  ok?: boolean;
-  resolved?: {
-    modelProvider?: string;
-    model?: string;
-  };
-};
-
 function normalizeRequestedSessionKey(raw: unknown): string | undefined {
   if (typeof raw !== "string") return undefined;
   const trimmed = raw.trim();
   return trimmed || undefined;
 }
 
-function buildActiveModelInstructions(requestedModel?: string): string | undefined {
-  if (!requestedModel) return undefined;
-  return [
-    `Active chat model for this request: ${requestedModel}.`,
-    `If the user asks which model you are using, answer with ${requestedModel}.`,
-    "If they ask about the saved agent setup or default model, distinguish that from the active chat model.",
-  ].join(" ");
-}
-
-function buildModelLockError(
-  requestedModel: string,
-  detail: string,
-  status = 503,
-): Response {
-  return new Response(
-    [
-      `Mission Control could not use ${requestedModel}.`,
-      detail,
-      "To avoid sending your message with a different model, the request was stopped.",
-      "Try again, or switch this chat back to the agent setup.",
-    ].join(" "),
-    {
-      status,
-      headers: { "Content-Type": "text/plain; charset=utf-8" },
-    },
-  );
-}
-
-async function ensureChatSessionModel(
-  sessionKey: string | undefined,
-  requestedModel: string | undefined,
-): Promise<Response | null> {
-  if (!sessionKey) {
-    if (!requestedModel) return null;
-    return buildModelLockError(
-      requestedModel,
-      "Mission Control could not create a stable OpenClaw session for this chat.",
-      400,
-    );
-  }
-
-  let patchResult: SessionsPatchResult;
-  try {
-    patchResult = await gatewayCall<SessionsPatchResult>(
-      "sessions.patch",
-      { key: sessionKey, model: requestedModel ?? null },
-      15000,
-    );
-  } catch (err) {
-    if (!requestedModel) return null;
-    return buildModelLockError(
-      requestedModel,
-      `The OpenClaw gateway could not save the selected chat model (${String(err)}).`,
-    );
-  }
-
-  if (!requestedModel) return null;
-
-  const resolvedProvider = patchResult.resolved?.modelProvider?.trim();
-  const resolvedModel = patchResult.resolved?.model?.trim();
-  const resolvedRef =
-    resolvedProvider && resolvedModel ? `${resolvedProvider}/${resolvedModel}` : "";
-
-  if (resolvedRef === requestedModel) return null;
-
-  return buildModelLockError(
-    requestedModel,
-    resolvedRef
-      ? `OpenClaw resolved this chat to ${resolvedRef} instead.`
-      : "OpenClaw did not confirm the selected chat model.",
-    409,
-  );
-}
 
 function extractContent(messages: Message[]): {
   plainText: string;
@@ -235,7 +153,6 @@ async function tryStreamingResponse(
   input: unknown,
   agentId: string,
   sessionKey?: string,
-  requestedModel?: string,
 ): Promise<Response | null> {
   let gwUrl: string;
   let token: string;
@@ -254,14 +171,11 @@ async function tryStreamingResponse(
   if (sessionKey) headers["x-openclaw-session-key"] = sessionKey;
   if (token) headers["Authorization"] = `Bearer ${token}`;
 
-  const explicitModel = requestedModel?.trim() || undefined;
   const orBody: Record<string, unknown> = {
     model: `openclaw:${agentId}`,
     input,
     stream: true,
   };
-  const activeModelInstructions = buildActiveModelInstructions(explicitModel);
-  if (activeModelInstructions) orBody.instructions = activeModelInstructions;
 
   const endpoint = `${gwUrl}/v1/responses`;
   const controller = new AbortController();
@@ -277,13 +191,6 @@ async function tryStreamingResponse(
     });
   } catch (e) {
     clearTimeout(timeout);
-    if (explicitModel) {
-      return buildModelLockError(
-        explicitModel,
-        "The OpenClaw gateway is unavailable right now.",
-        503,
-      );
-    }
     console.warn(`[chat] Gateway unreachable at ${endpoint}:`, e);
     return null;
   }
@@ -292,20 +199,12 @@ async function tryStreamingResponse(
     clearTimeout(timeout);
     const status = gwRes.status;
     const text = await gwRes.text().catch(() => "");
-    if (explicitModel) {
-      const detail = text.trim();
-      return buildModelLockError(
-        explicitModel,
-        detail || `The OpenClaw gateway returned ${status}.`,
-        status,
-      );
-    }
     console.warn(`[chat] Gateway returned ${status} from ${endpoint}.`, text.slice(0, 200));
     return null;
   }
 
   console.log(
-    `[chat] Streaming via gateway OpenResponses API (agent=${agentId}, session=${sessionKey || "ephemeral"}, model=${explicitModel || "agent-setup"})`,
+    `[chat] Streaming via gateway OpenResponses API (agent=${agentId}, session=${sessionKey || "ephemeral"})`,
   );
 
   // Stream text deltas as plain text for TextStreamChatTransport
@@ -339,44 +238,22 @@ async function nonStreamingResponse(
   input: unknown,
   agentId: string,
   sessionKey?: string,
-  requestedModel?: string,
 ): Promise<Response | null> {
-  const explicitModel = requestedModel?.trim() || undefined;
-  const activeModelInstructions = buildActiveModelInstructions(explicitModel);
-
   try {
     const result = await runOpenResponsesText({
       input,
       agentId,
       sessionKey,
-      requestedModel: explicitModel,
-      instructions: activeModelInstructions,
       timeoutMs: 180_000,
     });
 
-    if (!result.ok) {
-      if (explicitModel) {
-        return buildModelLockError(
-          explicitModel,
-          result.text || `The OpenClaw gateway returned ${result.status}.`,
-          result.status,
-        );
-      }
-      return null;
-    }
+    if (!result.ok) return null;
 
     return new Response(result.text || "", {
       status: 200,
       headers: { "Content-Type": "text/plain; charset=utf-8" },
     });
-  } catch (error) {
-    if (explicitModel) {
-      return buildModelLockError(
-        explicitModel,
-        `The OpenClaw gateway is unavailable right now (${String(error)}).`,
-        503,
-      );
-    }
+  } catch {
     return null;
   }
 }
@@ -403,10 +280,6 @@ export async function POST(req: Request) {
     const messages: Message[] = body.messages || [];
     const agentId: string = body.agentId || "main";
     const sessionKey = normalizeRequestedSessionKey(body.sessionKey);
-    const requestedModel =
-      typeof body.model === "string" && body.model.trim()
-        ? body.model.trim()
-        : undefined;
 
     const { plainText, openResponsesInput } = extractContent(messages);
 
@@ -417,12 +290,6 @@ export async function POST(req: Request) {
       });
     }
 
-    const sessionModelError = await ensureChatSessionModel(
-      sessionKey,
-      requestedModel,
-    );
-    if (sessionModelError) return sessionModelError;
-
     // Wait for the responses endpoint setup if it's still in progress
     // (ensureResponsesEndpoint fires async on the first gateway health check)
     await waitForResponsesEndpoint();
@@ -432,7 +299,6 @@ export async function POST(req: Request) {
       openResponsesInput,
       agentId,
       sessionKey,
-      requestedModel,
     );
     if (streamingRes) return streamingRes;
 
@@ -441,7 +307,6 @@ export async function POST(req: Request) {
       openResponsesInput,
       agentId,
       sessionKey,
-      requestedModel,
     );
     if (textRes) return textRes;
 

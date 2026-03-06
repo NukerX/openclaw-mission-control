@@ -299,7 +299,7 @@ export function PairingNotifications() {
       if (document.visibilityState === "visible") {
         void fetchData();
       }
-    }, 15000);
+    }, 5000);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -516,7 +516,7 @@ export function PairingNotifications() {
           {/* Footer */}
           <div className="border-t border-foreground/10 px-4 py-2">
             <p className="text-xs text-muted-foreground/60">
-              Polling every 15s &middot; DM codes expire after 1 hour
+              Polling every 5s &middot; DM codes expire after 1 hour
             </p>
           </div>
 

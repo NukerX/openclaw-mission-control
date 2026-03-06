@@ -1,3492 +1,1074 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore } from "react";
+import { useCallback, useRef, useState } from "react";
 import {
+  AlertCircle,
   AlertTriangle,
-  Bot,
   Check,
-  ChevronDown,
   ChevronLeft,
+  ChevronRight,
   ExternalLink,
-  Eye,
-  EyeOff,
-  Image as ImageIcon,
-  KeyRound,
-  ListOrdered,
+  Key,
   Loader2,
   Plus,
-  RefreshCw,
-  RotateCcw,
   Search,
-  Shield,
-  SlidersHorizontal,
-  Sparkles,
-  Tag,
   Trash2,
   X,
+  Zap,
 } from "lucide-react";
-import { requestRestart } from "@/lib/restart-store";
-import {
-  subscribeGatewayStatus,
-  getGatewayStatusSnapshot,
-  getGatewayStatusServerSnapshot,
-} from "@/lib/gateway-status-store";
 import { cn } from "@/lib/utils";
-import { LoadingState } from "@/components/ui/loading-state";
-import { ApiWarningBadge } from "@/components/ui/api-warning-badge";
 import { SectionBody, SectionHeader, SectionLayout } from "@/components/section-layout";
-import {
-  getModelMeta,
-  getFriendlyModelName,
-  getProviderDisplayName,
-  PROVIDER_INFO,
-} from "@/lib/model-metadata";
-import { ModelPicker } from "@/components/model-picker";
-import type { ModelOption } from "@/components/model-picker";
+import { useSmartPoll } from "@/hooks/use-smart-poll";
+import { getFriendlyModelName } from "@/lib/model-metadata";
 
-// ── Types ──
+/* ── Provider metadata ──────────────────────────── */
 
-type ModelInfo = {
-  key: string;
-  name: string;
-  input: string;
-  contextWindow: number;
-  local: boolean;
-  available: boolean;
-  tags: string[];
-  missing: boolean;
-};
-
-type ModelStatus = {
-  defaultModel: string;
-  resolvedDefault: string;
-  fallbacks: string[];
-  imageModel: string;
-  imageFallbacks: string[];
-  aliases: Record<string, string>;
-  allowed: string[];
-  auth?: {
-    providers?: Array<{
-      provider: string;
-      effective?: {
-        kind?: string;
-        detail?: string;
-      } | null;
-    }>;
-    oauth?: {
-      providers?: Array<{
-        provider: string;
-        status?: string;
-        remainingMs?: number;
-      }>;
-    };
-  };
-};
-
-type AuthOrderPayload = {
-  agentId: string;
-  provider: string;
-  order: string[] | null;
-};
-
-type DefaultsModelConfig = {
-  primary: string;
-  fallbacks: string[];
-};
-
-type HeartbeatConfig = { every: string; model: string };
-
-type AgentModelInfo = {
+type Provider = {
   id: string;
   name: string;
-  modelPrimary: string | null;
-  modelFallbacks: string[] | null;
-  usesDefaults: boolean;
-  subagents: string[];
-  parentId: string | null;
+  hint: string;
+  keyPrefix: string;
+  url: string;
 };
 
-type AgentRuntimeStatus = {
-  defaultModel: string;
-  resolvedDefault: string;
-  fallbacks: string[];
-};
+const PROVIDERS: Provider[] = [
+  { id: "anthropic", name: "Anthropic", hint: "Claude models", keyPrefix: "sk-ant-", url: "https://console.anthropic.com/settings/keys" },
+  { id: "openai", name: "OpenAI", hint: "GPT & o-series", keyPrefix: "sk-", url: "https://platform.openai.com/api-keys" },
+  { id: "google", name: "Google", hint: "Gemini models", keyPrefix: "AIza", url: "https://aistudio.google.com/apikey" },
+  { id: "openrouter", name: "OpenRouter", hint: "200+ models", keyPrefix: "sk-or-", url: "https://openrouter.ai/keys" },
+  { id: "groq", name: "Groq", hint: "Fast inference", keyPrefix: "gsk_", url: "https://console.groq.com/keys" },
+  { id: "xai", name: "xAI", hint: "Grok models", keyPrefix: "xai-", url: "https://console.x.ai/" },
+  { id: "mistral", name: "Mistral", hint: "Mistral models", keyPrefix: "", url: "https://console.mistral.ai/api-keys/" },
+];
 
-type LiveModelInfo = {
-  fullModel: string | null;
-  model: string | null;
-  provider: string | null;
-  updatedAt: number | null;
-  sessionKey: string | null;
-};
+function findProvider(id: string): Provider | undefined {
+  return PROVIDERS.find((p) => p.id === id);
+}
 
-type ModelCredentialProvider = {
-  provider: string;
-  connected: boolean;
-  effectiveKind: string | null;
-  effectiveDetail: string | null;
-  profileCount: number;
-  oauthCount: number;
-  tokenCount: number;
-  apiKeyCount: number;
-  labels: string[];
-  envSource: string | null;
-  envValue: string | null;
-  modelsJsonSource: string | null;
-};
+/* ── Types ──────────────────────────────────────── */
 
-type ModelCredentialAgentRow = {
-  agentId: string;
-  storePath: string | null;
-  shellEnvFallback: { enabled: boolean; appliedKeys: string[] };
-  providers: ModelCredentialProvider[];
-  oauthProfiles: Array<{
-    profileId: string;
-    provider: string;
-    type: string;
-    status: string;
-    source: string;
-    label: string;
-    expiresAt: number | null;
-    remainingMs: number | null;
-  }>;
-  unusableProfiles: Array<{
-    profileId: string;
-    provider: string;
-    kind: string;
-    until: number | null;
-    remainingMs: number | null;
-  }>;
-};
-
-type AgentAuthProfileStore = {
-  agentId: string;
-  path: string;
-  exists: boolean;
-  lastGood: Record<string, string>;
-  profiles: Array<{
-    id: string;
-    provider: string;
-    type: string;
-    accountId: string | null;
-    expiresAt: number | null;
-    remainingMs: number | null;
-    usage: {
-      lastUsed: number | null;
-      errorCount: number | null;
-      lastFailureAt: number | null;
-      cooldownUntil: number | null;
+type SummaryResponse = {
+  defaults: { primary: string; fallbacks: string[] } | null;
+  configuredProviders: string[];
+  status: {
+    auth: {
+      providers: Array<{ provider: string; effective: { kind: string; detail: string } | null }>;
     };
-    secretFields: Array<{ key: string; value: string; redacted: boolean }>;
-  }>;
-};
-
-type ModelsCredentialSnapshot = {
-  sourceOfTruth: { modelsStatus: boolean };
-  summary: {
-    modelProvidersConnected: number;
-    modelProvidersTotal: number;
-    authProfiles: number;
   };
-  modelAuthByAgent: ModelCredentialAgentRow[];
-  agentAuthProfiles: AgentAuthProfileStore[];
 };
 
-type ModelsCatalogProvider = {
-  provider: string;
-  config: Record<string, unknown>;
+type ModelItem = { id: string; name: string };
+
+type WizardStep = "pick" | "key" | "validating" | "pick-model" | "done";
+
+type WizardState = {
+  step: WizardStep;
+  providerId: string | null;
+  apiKey: string;
+  error: string | null;
+  models: ModelItem[];
+  loadingModels: boolean;
 };
 
-type ModelsCatalogConfig = {
-  mode: string;
-  providers: ModelsCatalogProvider[];
-};
+/* ── Shared atoms ────────────────────────────────── */
 
-type Toast = {
-  type: "success" | "error";
-  message: string;
-};
-
-type AdvancedTab = "agents" | "allowlist" | "routing" | "aliases";
-
-type PickerTarget =
-  | { kind: "default" }
-  | { kind: "default-fallback" }
-  | { kind: "image-model" }
-  | { kind: "image-fallback" }
-  | { kind: "heartbeat-model" }
-  | { kind: "agent"; agent: AgentModelInfo }
-  | { kind: "agent-fallback"; agent: AgentModelInfo }
-  | { kind: "allowlist" };
-
-// ── Utilities ──
-
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-function modelProvider(key: string): string {
-  if (!key.includes("/")) return "custom";
-  return key.split("/")[0];
-}
-
-function modelNameFromKey(key: string): string {
-  return key.split("/").pop() || key;
-}
-
-function getModelDisplayName(
-  key: string,
-  models: ModelInfo[],
-  aliases: Record<string, string>,
-): string {
-  const found = models.find((m) => m.key === key);
-  if (found?.name) return found.name;
-  const alias = Object.entries(aliases).find(([, modelKey]) => modelKey === key)?.[0];
-  if (alias) return alias;
-  return modelNameFromKey(key);
-}
-
-const PROVIDER_CONFIG_TEMPLATES: Record<string, Record<string, unknown>> = {
-  openai: {
-    baseUrl: "https://api.openai.com/v1",
-    api: "openai-responses",
-  },
-  openrouter: {
-    baseUrl: "https://openrouter.ai/api/v1",
-    api: "openai-completions",
-  },
-  anthropic: {
-    baseUrl: "https://api.anthropic.com/v1",
-    api: "anthropic-messages",
-  },
-  minimax: {
-    baseUrl: "https://api.minimax.io/anthropic",
-    api: "anthropic-messages",
-    apiKey: "${MINIMAX_API_KEY}",
-    models: [
-      { id: "MiniMax-M2.5", name: "MiniMax M2.5" },
-      { id: "MiniMax-M2.5-highspeed", name: "MiniMax M2.5 High-Speed" },
-      { id: "MiniMax-M2.1", name: "MiniMax M2.1" },
-      { id: "MiniMax-M2.1-highspeed", name: "MiniMax M2.1 High-Speed" },
-      { id: "MiniMax-M2", name: "MiniMax M2" },
-    ],
-  },
-  moonshot: {
-    baseUrl: "https://api.moonshot.cn/v1",
-    api: "openai-completions",
-  },
-};
-
-const CONNECT_PROVIDER_META: Record<
-  string,
-  { label: string; icon: string; keyUrl?: string; keyHint: string; keyOptional?: boolean; needsBaseUrl?: boolean; baseUrlPlaceholder?: string }
-> = {
-  anthropic: { label: "Anthropic", icon: "🟣", keyUrl: "https://console.anthropic.com/settings/keys", keyHint: "sk-ant-..." },
-  openai: { label: "OpenAI", icon: "🟢", keyUrl: "https://platform.openai.com/api-keys", keyHint: "sk-..." },
-  google: { label: "Google", icon: "🔵", keyUrl: "https://aistudio.google.com/apikey", keyHint: "AIza..." },
-  openrouter: { label: "OpenRouter", icon: "🟠", keyUrl: "https://openrouter.ai/keys", keyHint: "sk-or-..." },
-  minimax: { label: "MiniMax", icon: "🟡", keyUrl: "https://platform.minimaxi.com/", keyHint: "eyJ..." },
-  groq: { label: "Groq", icon: "⚡", keyUrl: "https://console.groq.com/keys", keyHint: "gsk_..." },
-  xai: { label: "xAI", icon: "𝕏", keyUrl: "https://console.x.ai/", keyHint: "xai-..." },
-  mistral: { label: "Mistral", icon: "🌊", keyUrl: "https://console.mistral.ai/api-keys/", keyHint: "" },
-  zai: { label: "Z.AI", icon: "💎", keyHint: "" },
-  cerebras: { label: "Cerebras", icon: "🧠", keyHint: "" },
-  huggingface: { label: "Hugging Face", icon: "🤗", keyUrl: "https://huggingface.co/settings/tokens", keyHint: "hf_..." },
-  custom: { label: "Custom Endpoint", icon: "🔗", keyHint: "Bearer token (optional)", keyOptional: true, needsBaseUrl: true, baseUrlPlaceholder: "http://localhost:1234/v1" },
-};
-
-/** Default model to auto-set when a provider is first connected (matches onboarding). */
-const PROVIDER_DEFAULT_MODEL: Record<string, string> = {
-  anthropic: "anthropic/claude-sonnet-4-20250514",
-  openai: "openai/gpt-4o",
-  google: "google/gemini-2.0-flash",
-  openrouter: "openrouter/anthropic/claude-sonnet-4",
-  minimax: "minimax/MiniMax-M2.1",
-  groq: "groq/llama-4-scout-17b-16e-instruct",
-  xai: "xai/grok-3-mini",
-  mistral: "mistral/mistral-medium-latest",
-};
-
-// ── Small Inline Components ──
-
-function StatusPill({
-  label,
-  tone = "neutral",
-}: {
-  label: string;
-  tone?: "neutral" | "good" | "warn" | "info";
-}) {
-  const cls =
-    tone === "good"
-      ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-      : tone === "warn"
-        ? "border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-300"
-        : tone === "info"
-          ? "border-[var(--accent-brand-border)] bg-[var(--accent-brand-subtle)] text-[var(--accent-brand-text)]"
-          : "border-border bg-muted/40 text-muted-foreground";
+function StatusDot({ active, className }: { active: boolean; className?: string }) {
   return (
-    <span
-      className={cn(
-        "inline-flex items-center rounded-md border px-1.5 py-0.5 text-xs font-medium",
-        cls,
+    <span className={cn("relative flex h-2.5 w-2.5 shrink-0", className)}>
+      {active && (
+        <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-40" />
       )}
-    >
-      {label}
+      <span
+        className={cn(
+          "relative inline-flex h-2.5 w-2.5 rounded-full",
+          active ? "bg-emerald-400" : "bg-[#3d4752]"
+        )}
+      />
     </span>
   );
 }
 
-function BusyDots() {
+function ProviderAvatar({ name }: { name: string }) {
   return (
-    <span className="inline-flex items-center gap-0.5">
-      <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:0ms]" />
-      <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:150ms]" />
-      <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:300ms]" />
-    </span>
+    <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl border border-[#2c343d] bg-[#20252a] text-sm font-bold text-[#a8b0ba]">
+      {name.charAt(0).toUpperCase()}
+    </div>
   );
 }
 
-// ── Main Component ──
+/* ── Model list (shared between wizard + picker modal) ── */
 
-export function ModelsView() {
-  // ── Data state ──
-  const [status, setStatus] = useState<ModelStatus | null>(null);
-  const [defaults, setDefaults] = useState<DefaultsModelConfig | null>(null);
-  const [models, setModels] = useState<ModelInfo[]>([]);
-  const [allModels, setAllModels] = useState<ModelInfo[]>([]);
-  const [allModelsLoading, setAllModelsLoading] = useState(false);
-  const [allModelsWarning, setAllModelsWarning] = useState<string | null>(null);
-  const [configuredAllowed, setConfiguredAllowed] = useState<string[]>([]);
-  const [agents, setAgents] = useState<AgentModelInfo[]>([]);
-  const [agentStatuses, setAgentStatuses] = useState<Record<string, AgentRuntimeStatus>>({});
-  const [liveModels, setLiveModels] = useState<Record<string, LiveModelInfo>>({});
-  const [heartbeat, setHeartbeat] = useState<HeartbeatConfig | null>(null);
-  const [configuredProviders, setConfiguredProviders] = useState<string[]>([]);
-  const [modelsCatalogConfig, setModelsCatalogConfig] = useState<ModelsCatalogConfig>({
-    mode: "merge",
-    providers: [],
-  });
-  const [modelCredentialSummary, setModelCredentialSummary] = useState<{
-    connected: number;
-    total: number;
-    profiles: number;
-    sourceOfTruth: boolean;
-  }>({ connected: 0, total: 0, profiles: 0, sourceOfTruth: false });
-  const [modelAuthByAgent, setModelAuthByAgent] = useState<ModelCredentialAgentRow[]>([]);
-  const [agentAuthProfiles, setAgentAuthProfiles] = useState<AgentAuthProfileStore[]>([]);
-  const [modelCredsError, setModelCredsError] = useState<string | null>(null);
-  const [revealModelSecrets, setRevealModelSecrets] = useState(false);
-  const [apiWarning, setApiWarning] = useState<string | null>(null);
-  const [apiDegraded, setApiDegraded] = useState(false);
+function ModelList({
+  models,
+  loading,
+  currentModel,
+  onSelect,
+}: {
+  models: ModelItem[];
+  loading: boolean;
+  currentModel: string | null;
+  onSelect: (id: string) => void | Promise<void>;
+}) {
+  const [query, setQuery] = useState("");
 
-  // ── UI state ──
-  const [summaryLoading, setSummaryLoading] = useState(true);
-  const [auditLoading, setAuditLoading] = useState(false);
-  const [auditRequested, setAuditRequested] = useState(false);
-  const [detailsLoading, setDetailsLoading] = useState(false);
-  const [detailsRequested, setDetailsRequested] = useState(false);
-  const [allModelsRequested, setAllModelsRequested] = useState(false);
-  const [busyKey, setBusyKey] = useState<string | null>(null);
-  const [toast, setToast] = useState<Toast | null>(null);
-  const [advancedOpen, setAdvancedOpen] = useState(false);
-  const [advancedTab, setAdvancedTab] = useState<AdvancedTab>("agents");
-  const [authAuditOpen, setAuthAuditOpen] = useState(false);
-  const [pickerTarget, setPickerTarget] = useState<PickerTarget | null>(null);
-
-  // Alias form state
-  const [aliasName, setAliasName] = useState("");
-  const [aliasTarget, setAliasTarget] = useState("");
-
-  // Allowlist state
-  const [customModelToAdd, setCustomModelToAdd] = useState("");
-  const [providerDraftId, setProviderDraftId] = useState("");
-  const [providerDraftCustomId, setProviderDraftCustomId] = useState("");
-  const [providerDraftJson, setProviderDraftJson] = useState(
-    JSON.stringify(PROVIDER_CONFIG_TEMPLATES.openrouter, null, 2),
-  );
-  const [providerDraftError, setProviderDraftError] = useState<string | null>(null);
-  const [heartbeatEveryDraft, setHeartbeatEveryDraft] = useState("");
-
-  // Auth order state
-  const [orderAgentId, setOrderAgentId] = useState("main");
-  const [orderProvider, setOrderProvider] = useState("openai");
-  const [orderDraft, setOrderDraft] = useState<string[]>([]);
-  const [orderSelectedProfileId, setOrderSelectedProfileId] = useState("");
-  const [orderLoading, setOrderLoading] = useState(false);
-  const [orderBusy, setOrderBusy] = useState(false);
-  const [orderError, setOrderError] = useState<string | null>(null);
-
-  // Connect-provider inline flow state
-  const [connectProvider, setConnectProvider] = useState<string | null>(null);
-  const [connectKey, setConnectKey] = useState("");
-  const [connectBaseUrl, setConnectBaseUrl] = useState("");
-  const [connectShowKey, setConnectShowKey] = useState(false);
-  const [connectSaving, setConnectSaving] = useState(false);
-  const [connectSuccess, setConnectSuccess] = useState<string | null>(null);
-  const [connectPhase, setConnectPhase] = useState<"key" | "configure">("key");
-  const [connectValidatedKey, setConnectValidatedKey] = useState("");
-  const [connectModels, setConnectModels] = useState<{ id: string; name: string }[]>([]);
-  const [connectModelsLoading, setConnectModelsLoading] = useState(false);
-  const [connectSelectedModel, setConnectSelectedModel] = useState("");
-  const [connectSelectedAgent, setConnectSelectedAgent] = useState("");
-
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const providerAccessRef = useRef<HTMLElement>(null);
-
-  // ── Core callbacks ──
-
-  const flash = useCallback((message: string, type: "success" | "error") => {
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    setToast({ message, type });
-    toastTimer.current = setTimeout(() => setToast(null), 3200);
-  }, []);
-
-  const postModelAction = useCallback(async (body: Record<string, unknown>) => {
-    const res = await fetch("/api/models", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body),
-    });
-    const data = await res.json().catch(() => null);
-    if (!res.ok || !data || data.error) {
-      throw new Error(String(data?.error || `Request failed with ${res.status}`));
-    }
-    return data as Record<string, unknown>;
-  }, []);
-
-  const applyModelPayload = useCallback(
-    (payload: Record<string, unknown>, options?: { mergeStatus?: boolean }) => {
-      setApiWarning(
-        typeof payload.warning === "string" && payload.warning.trim()
-          ? payload.warning.trim()
-          : null,
-      );
-      setApiDegraded(Boolean(payload.degraded));
-      if (payload.error) {
-        console.warn("Models API partial error:", payload.error);
-      }
-
-      if (payload.status && typeof payload.status === "object") {
-        const nextStatus = payload.status as ModelStatus;
-        setStatus((prev) =>
-          options?.mergeStatus && prev
-            ? {
-                ...prev,
-                ...nextStatus,
-                auth: nextStatus.auth ?? prev.auth,
-              }
-            : nextStatus,
-        );
-      }
-
-      if ("defaults" in payload) {
-        if (payload.defaults && typeof payload.defaults === "object") {
-          const nextDefaults = payload.defaults as {
-            primary?: unknown;
-            fallbacks?: unknown;
-          };
-          if (typeof nextDefaults.primary === "string") {
-            setDefaults({
-              primary: nextDefaults.primary,
-              fallbacks: Array.isArray(nextDefaults.fallbacks)
-                ? nextDefaults.fallbacks.map((value) => String(value)).filter(Boolean)
-                : [],
-            });
-          } else {
-            setDefaults(null);
-          }
-        } else {
-          setDefaults(null);
-        }
-      }
-
-      if (Array.isArray(payload.models)) {
-        setModels(payload.models as ModelInfo[]);
-      }
-
-      if ("allowedConfigured" in payload) {
-        setConfiguredAllowed(
-          Array.isArray(payload.allowedConfigured)
-            ? payload.allowedConfigured.map((entry) => String(entry)).filter(Boolean)
-            : [],
-        );
-      }
-
-      if (Array.isArray(payload.agents)) {
-        setAgents(payload.agents as AgentModelInfo[]);
-      }
-
-      if (payload.agentStatuses && typeof payload.agentStatuses === "object") {
-        setAgentStatuses(payload.agentStatuses as Record<string, AgentRuntimeStatus>);
-      }
-
-      if (payload.liveModels && typeof payload.liveModels === "object") {
-        setLiveModels(payload.liveModels as Record<string, LiveModelInfo>);
-      }
-
-      if ("configuredProviders" in payload) {
-        setConfiguredProviders(
-          Array.isArray(payload.configuredProviders)
-            ? payload.configuredProviders.map((entry) => String(entry)).filter(Boolean)
-            : [],
-        );
-      }
-
-      if ("heartbeat" in payload) {
-        if (payload.heartbeat && typeof payload.heartbeat === "object") {
-          const nextHeartbeat = payload.heartbeat as {
-            every?: unknown;
-            model?: unknown;
-          };
-          setHeartbeat({
-            every: typeof nextHeartbeat.every === "string" ? nextHeartbeat.every : "",
-            model: typeof nextHeartbeat.model === "string" ? nextHeartbeat.model : "",
-          });
-        } else {
-          setHeartbeat(null);
-        }
-      }
-
-      if ("modelsCatalogConfig" in payload) {
-        if (payload.modelsCatalogConfig && typeof payload.modelsCatalogConfig === "object") {
-          const next = payload.modelsCatalogConfig as {
-            mode?: unknown;
-            providers?: unknown;
-          };
-          const providers = Array.isArray(next.providers)
-            ? next.providers
-                .map((entry) => {
-                  if (!entry || typeof entry !== "object") return null;
-                  const row = entry as { provider?: unknown; config?: unknown };
-                  const provider = String(row.provider || "").trim();
-                  if (!provider) return null;
-                  const config =
-                    row.config && typeof row.config === "object" && !Array.isArray(row.config)
-                      ? (row.config as Record<string, unknown>)
-                      : {};
-                  return { provider, config };
-                })
-                .filter((entry): entry is ModelsCatalogProvider => Boolean(entry))
-            : [];
-          setModelsCatalogConfig({
-            mode:
-              typeof next.mode === "string" && next.mode.trim().toLowerCase() === "replace"
-                ? "replace"
-                : "merge",
-            providers,
-          });
-        } else {
-          setModelsCatalogConfig({ mode: "merge", providers: [] });
-        }
-      }
-    },
-    [],
-  );
-
-  const fetchSummary = useCallback(async () => {
-    setSummaryLoading(true);
-    try {
-      const res = await fetch("/api/models/summary", {
-        cache: "no-store",
-        signal: AbortSignal.timeout(30000),
-      });
-      const data = (await res.json()) as Record<string, unknown>;
-      applyModelPayload(data);
-    } catch (err) {
-      console.warn("Failed to fetch models summary:", err);
-      setApiWarning(err instanceof Error ? err.message : String(err));
-      setApiDegraded(true);
-    } finally {
-      setSummaryLoading(false);
-    }
-  }, [applyModelPayload]);
-
-  const fetchAllModels = useCallback(async (force = false) => {
-    if (!force && (allModelsRequested || allModelsLoading)) return;
-    setAllModelsRequested(true);
-    setAllModelsLoading(true);
-    try {
-      const url = force ? "/api/models?scope=all&refresh=1" : "/api/models?scope=all";
-      const res = await fetch(url, {
-        cache: "no-store",
-        signal: AbortSignal.timeout(30000),
-      });
-      const data = await res.json();
-      const nextModels = Array.isArray(data.models) ? (data.models as ModelInfo[]) : [];
-      setAllModels(nextModels);
-      setAllModelsWarning(
-        typeof data.warning === "string" && data.warning.trim() ? data.warning.trim() : null,
-      );
-    } catch (err) {
-      setAllModelsWarning(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAllModelsLoading(false);
-    }
-  }, [allModelsLoading, allModelsRequested]);
-
-  const fetchAdvancedDetails = useCallback(async (force = false) => {
-    if (!force && (detailsRequested || detailsLoading)) return;
-    setDetailsRequested(true);
-    setDetailsLoading(true);
-    try {
-      const res = await fetch("/api/models?scope=details", {
-        cache: "no-store",
-        signal: AbortSignal.timeout(30000),
-      });
-      const data = (await res.json()) as Record<string, unknown>;
-      applyModelPayload(data, { mergeStatus: true });
-    } catch (err) {
-      console.warn("Failed to fetch model details:", err);
-    } finally {
-      setDetailsLoading(false);
-    }
-  }, [applyModelPayload, detailsLoading, detailsRequested]);
-
-  const fetchAudit = useCallback(async (force = false) => {
-    if (!force && (auditRequested || auditLoading)) return;
-    setAuditRequested(true);
-    setAuditLoading(true);
-    try {
-      const accountsRes = await fetch("/api/accounts", {
-        cache: "no-store",
-        signal: AbortSignal.timeout(15000),
-      });
-      const accountsData = (await accountsRes.json()) as
-        | (ModelsCredentialSnapshot & { error?: string })
-        | { error?: string };
-      if (!accountsRes.ok) {
-        throw new Error(
-          (accountsData as { error?: string })?.error || `HTTP ${accountsRes.status}`,
-        );
-      }
-      const snapshot = accountsData as ModelsCredentialSnapshot;
-      setModelCredentialSummary({
-        connected: Number(snapshot.summary?.modelProvidersConnected || 0),
-        total: Number(snapshot.summary?.modelProvidersTotal || 0),
-        profiles: Number(snapshot.summary?.authProfiles || 0),
-        sourceOfTruth: Boolean(snapshot.sourceOfTruth?.modelsStatus),
-      });
-      setModelAuthByAgent(
-        Array.isArray(snapshot.modelAuthByAgent) ? snapshot.modelAuthByAgent : [],
-      );
-      setAgentAuthProfiles(
-        Array.isArray(snapshot.agentAuthProfiles) ? snapshot.agentAuthProfiles : [],
-      );
-      setModelCredsError(null);
-    } catch (err) {
-      setModelCredsError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setAuditLoading(false);
-    }
-  }, [auditLoading, auditRequested]);
-
-  useEffect(() => {
-    void fetchSummary();
-  }, [fetchSummary]);
-
-  useEffect(() => {
-    const needsCatalog =
-      Boolean(pickerTarget) ||
-      (advancedOpen &&
-        (advancedTab === "allowlist" || advancedTab === "routing" || advancedTab === "aliases"));
-    if (!needsCatalog) return;
-    void fetchAllModels();
-  }, [advancedOpen, advancedTab, fetchAllModels, pickerTarget]);
-
-  useEffect(() => {
-    const needsDetails =
-      advancedOpen && (advancedTab === "routing" || advancedTab === "aliases");
-    if (!needsDetails) return;
-    void fetchAdvancedDetails();
-  }, [advancedOpen, advancedTab, fetchAdvancedDetails]);
-
-  useEffect(() => {
-    if (!advancedOpen || advancedTab !== "aliases") return;
-    void fetchAudit();
-  }, [advancedOpen, advancedTab, fetchAudit]);
-
-  // Re-fetch models when gateway comes back online after a restart
-  const gwStatus = useSyncExternalStore(
-    subscribeGatewayStatus,
-    getGatewayStatusSnapshot,
-    getGatewayStatusServerSnapshot,
-  );
-  const prevGwStatusRef = useRef(gwStatus.status);
-  useEffect(() => {
-    const prev = prevGwStatusRef.current;
-    prevGwStatusRef.current = gwStatus.status;
-    if (gwStatus.status === "online" && prev !== "online") {
-      // Gateway just came back — refetch after a short delay for it to settle
-      const t = setTimeout(() => {
-        void fetchSummary();
-        if (allModelsRequested) void fetchAllModels(true);
-        if (detailsRequested) void fetchAdvancedDetails(true);
-        if (auditRequested) void fetchAudit(true);
-      }, 1500);
-      return () => clearTimeout(t);
-    }
-  }, [
-    allModelsRequested,
-    auditRequested,
-    detailsRequested,
-    fetchAdvancedDetails,
-    fetchAllModels,
-    fetchAudit,
-    fetchSummary,
-    gwStatus.status,
-  ]);
-
-  // Phase 1: Validate key and fetch models, then transition to configure phase
-  const handleValidateKey = useCallback(async () => {
-    if (!connectProvider) return;
-    const isCustom = connectProvider === "custom";
-    if (!isCustom && !connectKey.trim()) return;
-    if (isCustom && !connectBaseUrl.trim()) return;
-    setConnectSaving(true);
-    try {
-      // Validate the key/endpoint
-      const testRes = await fetch("/api/onboard", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(
-          isCustom
-            ? { action: "test-key", provider: "custom", baseUrl: connectBaseUrl.trim(), token: connectKey.trim() || "" }
-            : { action: "test-key", provider: connectProvider, token: connectKey.trim() },
-        ),
-      });
-      const testData = await testRes.json().catch(() => ({ ok: false, error: `Validation request failed (${testRes.status})` }));
-      if (!testData.ok) {
-        flash(testData.error || "API key validation failed — check the key and try again.", "error");
-        setConnectSaving(false);
-        return;
-      }
-
-      // Key is valid — store it and fetch available models
-      setConnectValidatedKey(connectKey.trim());
-      setConnectModelsLoading(true);
-      setConnectPhase("configure");
-      setConnectSaving(false);
-
-      // Fetch models in the background (non-blocking transition)
-      try {
-        const modelsRes = await fetch("/api/onboard", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(
-            isCustom
-              ? { action: "list-models", provider: "custom", baseUrl: connectBaseUrl.trim(), token: connectKey.trim() || "" }
-              : { action: "list-models", provider: connectProvider, token: connectKey.trim() },
-          ),
-        });
-        const modelsData = await modelsRes.json().catch(() => ({ ok: false }));
-        if (modelsData.ok && Array.isArray(modelsData.models)) {
-          const fetched = modelsData.models as { id: string; name: string }[];
-          setConnectModels(fetched);
-          // Pre-select provider default or first model
-          const defaultModel = PROVIDER_DEFAULT_MODEL[connectProvider];
-          if (defaultModel && fetched.some((m) => m.id === defaultModel)) {
-            setConnectSelectedModel(defaultModel);
-          } else if (fetched.length > 0) {
-            setConnectSelectedModel(fetched[0].id);
-          }
-        }
-      } catch {
-        // Model fetch failed — graceful degradation, user can still save key only
-      }
-      setConnectModelsLoading(false);
-    } catch {
-      flash("Failed to validate key", "error");
-      setConnectSaving(false);
-    }
-  }, [connectBaseUrl, connectKey, connectProvider, flash]);
-
-  // Phase 2: Save key + model + agent assignment
-  const handleConnectSave = useCallback(async () => {
-    if (!connectProvider) return;
-    const isCustom = connectProvider === "custom";
-    setConnectSaving(true);
-    try {
-      // Step 1: Save the key
-      if (isCustom) {
-        const res = await fetch("/api/onboard", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({
-            action: "save-credentials",
-            provider: "custom",
-            apiKey: connectValidatedKey || "",
-            baseUrl: connectBaseUrl.trim(),
-          }),
-        });
-        const data = await res.json().catch(() => ({ ok: false, error: "Server returned an invalid response" }));
-        if (!data.ok) {
-          flash(data.error || "Failed to connect custom endpoint", "error");
-          setConnectSaving(false);
-          return;
-        }
-      } else {
-        try {
-          await postModelAction({
-            action: "auth-provider",
-            provider: connectProvider,
-            token: connectValidatedKey,
-          });
-        } catch (err) {
-          flash(err instanceof Error ? err.message : "Failed to connect provider", "error");
-          setConnectSaving(false);
-          return;
-        }
-      }
-
-      // Step 2: Assign model (if one was selected)
-      const providerLabel = CONNECT_PROVIDER_META[connectProvider]?.label || connectProvider;
-      let successMessage = `${providerLabel} connected.`;
-      const selectedModel = connectSelectedModel;
-
-      if (selectedModel) {
-        try {
-          if (connectSelectedAgent) {
-            // Assign to specific agent
-            await postModelAction({
-              action: "set-agent-model",
-              agentId: connectSelectedAgent,
-              model: selectedModel,
-              fallbacks: null,
-            });
-            const agentName = agents.find((a) => a.id === connectSelectedAgent)?.name || connectSelectedAgent;
-            successMessage = `${providerLabel} connected. ${agentName} set to ${getFriendlyModelName(selectedModel)}.`;
-          } else {
-            // Set as primary/default
-            await postModelAction({ action: "set-primary", model: selectedModel });
-            successMessage = `${providerLabel} connected. New chats will start with ${getFriendlyModelName(selectedModel)}.`;
-          }
-        } catch (err) {
-          successMessage = `${providerLabel} connected. Could not assign model automatically — choose it below.`;
-          console.warn("Connected provider but failed to set model:", err);
-        }
-      }
-
-      // Step 3: Clean up and refresh
-      const savedProvider = connectProvider;
-      setConnectSuccess(savedProvider);
-      setConnectKey("");
-      setConnectBaseUrl("");
-      setConnectValidatedKey("");
-      setConnectModels([]);
-      setConnectSelectedModel("");
-      setConnectSelectedAgent("");
-      setConnectPhase("key");
-      setConnectProvider(null);
-      setConnectShowKey(false);
-
-      flash(successMessage, "success");
-      await fetchSummary();
-      if (allModelsRequested) await fetchAllModels(true);
-      if (detailsRequested) await fetchAdvancedDetails(true);
-      if (auditRequested) await fetchAudit(true);
-      setTimeout(() => setConnectSuccess(null), 3000);
-    } catch {
-      flash("Failed to connect provider", "error");
-    }
-    setConnectSaving(false);
-  }, [
-    agents,
-    allModelsRequested,
-    auditRequested,
-    connectBaseUrl,
-    connectProvider,
-    connectSelectedAgent,
-    connectSelectedModel,
-    connectValidatedKey,
-    detailsRequested,
-    fetchAdvancedDetails,
-    fetchAllModels,
-    fetchAudit,
-    fetchSummary,
-    flash,
-    postModelAction,
-  ]);
-
-  const openProviderSetup = useCallback((provider: string) => {
-    const target = provider.trim().toLowerCase();
-    if (!target) return;
-    setConnectSuccess(null);
-    setConnectProvider(target);
-    setConnectKey("");
-    setConnectBaseUrl("");
-    setConnectShowKey(false);
-    setConnectPhase("key");
-    setConnectValidatedKey("");
-    setConnectModels([]);
-    setConnectSelectedModel("");
-    setConnectSelectedAgent("");
-    requestAnimationFrame(() => {
-      providerAccessRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
-    });
-  }, []);
-
-  const runAction = useCallback(
-    async (
-      body: Record<string, unknown>,
-      successMsg: string,
-      key: string,
-      options?: { restart?: boolean; refreshCatalog?: boolean },
-    ) => {
-      setBusyKey(key);
-      const maxAttempts = 3;
-      const isTransient = (msg: string) => {
-        const m = msg.toLowerCase();
+  const filtered = query.trim()
+    ? models.filter((m) => {
+        const q = query.toLowerCase();
         return (
-          m.includes("gateway closed") ||
-          m.includes("1006") ||
-          m.includes("gateway call failed")
+          m.id.toLowerCase().includes(q) ||
+          m.name.toLowerCase().includes(q) ||
+          getFriendlyModelName(m.id).toLowerCase().includes(q)
         );
-      };
-      try {
-        for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-          try {
-            await postModelAction(body);
-            flash(successMsg, "success");
-            if (options?.restart !== false) {
-              requestRestart("Model configuration was updated.");
-            }
-            await fetchSummary();
-            if (detailsRequested) {
-              await fetchAdvancedDetails(true);
-            }
-            if (options?.refreshCatalog || allModelsRequested) {
-              await fetchAllModels(true);
-            }
-            if (auditRequested) {
-              await fetchAudit(true);
-            }
-            return;
-          } catch (err) {
-            const msg = String(err);
-            if (isTransient(msg) && attempt < maxAttempts) {
-              await sleep(900 * attempt);
-              continue;
-            }
-            flash(msg, "error");
-            return;
-          }
-        }
-      } finally {
-        setBusyKey(null);
-      }
-    },
-    [
-      allModelsRequested,
-      auditRequested,
-      detailsRequested,
-      fetchAdvancedDetails,
-      fetchAllModels,
-      fetchAudit,
-      fetchSummary,
-      flash,
-      postModelAction,
-    ],
-  );
+      })
+    : models;
 
-  // ── Derived data ──
-
-  const aliases = useMemo(() => status?.aliases || {}, [status]);
-  const defaultPrimary = defaults?.primary || status?.defaultModel || "";
-  const defaultFallbacks = useMemo(
-    () => defaults?.fallbacks || status?.fallbacks || [],
-    [defaults, status],
-  );
-  const defaultResolved = status?.resolvedDefault || defaultPrimary;
-
-  const sortedAgents = useMemo(() => {
-    return [...agents].sort((a, b) => {
-      if (a.id === "main" && b.id !== "main") return -1;
-      if (a.id !== "main" && b.id === "main") return 1;
-      return a.name.localeCompare(b.name);
-    });
-  }, [agents]);
-
-  const agentNameById = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const agent of agents) map.set(agent.id, agent.name);
-    return map;
-  }, [agents]);
-
-  // Whether the gateway reported auth data — if not, we can't tell which
-  // providers are truly connected so we shouldn't mark them as disconnected.
-  const hasGatewayAuth = Boolean(
-    status?.auth?.providers?.length || status?.auth?.oauth?.providers?.length,
-  );
-
-  const providerAuthMap = useMemo(() => {
-    const map = new Map<
-      string,
-      { connected: boolean; authKind: string | null; oauthStatus: string | null }
-    >();
-    // 1. Gateway-reported auth — the source of truth when available
-    const authProviders = status?.auth?.providers || [];
-    for (const provider of authProviders) {
-      const providerKey = String(provider.provider || "").trim();
-      if (!providerKey) continue;
-      map.set(providerKey, {
-        connected: Boolean(provider.effective),
-        authKind: provider.effective?.kind || null,
-        oauthStatus: null,
-      });
-    }
-    // 2. OAuth providers
-    const oauthProviders = status?.auth?.oauth?.providers || [];
-    for (const provider of oauthProviders) {
-      const providerKey = String(provider.provider || "").trim();
-      if (!providerKey) continue;
-      const prev = map.get(providerKey);
-      const oauthStatus = provider.status || null;
-      const oauthConnected = oauthStatus === "ok" || oauthStatus === "static";
-      map.set(providerKey, {
-        connected: Boolean(prev?.connected || oauthConnected),
-        authKind: prev?.authKind || null,
-        oauthStatus,
-      });
-    }
-    // 3. Local providers discovered from model catalog
-    const localProviders = new Set<string>();
-    for (const model of [...models, ...allModels]) {
-      const provider = modelProvider(model.key);
-      if (!provider || provider === "custom") continue;
-      if (model.local) localProviders.add(provider);
-    }
-    for (const provider of localProviders) {
-      const prev = map.get(provider);
-      map.set(provider, {
-        connected: true,
-        authKind: prev?.authKind || "local",
-        oauthStatus: prev?.oauthStatus || null,
-      });
-    }
-    // 4. Providers referenced in config but not yet tracked.
-    //    If the gateway reported auth data, we trust it — an untracked provider
-    //    means it has no credentials. If the gateway didn't report auth (degraded
-    //    response, still starting, etc.) we can't tell, so don't show them at all
-    //    rather than falsely marking them disconnected.
-    if (hasGatewayAuth) {
-      for (const provider of configuredProviders) {
-        if (!provider || map.has(provider)) continue;
-        const providerIsLocal =
-          provider === "ollama" || provider === "vllm" || provider === "lmstudio";
-        map.set(provider, {
-          connected: providerIsLocal,
-          authKind: providerIsLocal ? "local" : null,
-          oauthStatus: null,
-        });
-      }
-    }
-    return map;
-  }, [allModels, configuredProviders, hasGatewayAuth, models, status]);
-
-  const allowedModels = useMemo(
-    () => new Set((status?.allowed || []).map((m) => String(m))),
-    [status],
-  );
-
-  const configuredOptionMap = useMemo(() => {
-    const map = new Map<string, ModelOption>();
-    for (const model of models) {
-      const provider = modelProvider(model.key);
-      const auth = providerAuthMap.get(provider);
-      const ready = Boolean(model.local || model.available || allowedModels.has(model.key));
-      map.set(model.key, {
-        key: model.key,
-        name: model.name || modelNameFromKey(model.key),
-        provider,
-        available: Boolean(model.available),
-        local: Boolean(model.local),
-        known: true,
-        ready,
-        authConnected: Boolean(auth?.connected),
-        authKind: auth?.authKind || null,
-        oauthStatus: auth?.oauthStatus || null,
-      });
-    }
-
-    const ensure = (key: string | null | undefined) => {
-      if (!key || map.has(key)) return;
-      const provider = modelProvider(key);
-      const auth = providerAuthMap.get(provider);
-      map.set(key, {
-        key,
-        name: modelNameFromKey(key),
-        provider,
-        available: true,
-        local: false,
-        known: false,
-        ready: true,
-        authConnected: Boolean(auth?.connected),
-        authKind: auth?.authKind || null,
-        oauthStatus: auth?.oauthStatus || null,
-      });
-    };
-
-    ensure(defaultPrimary);
-    ensure(defaultResolved);
-    if (heartbeat?.model) ensure(heartbeat.model);
-    if (status?.imageModel) ensure(status.imageModel);
-    for (const fallback of status?.imageFallbacks || []) ensure(fallback);
-
-    for (const agent of agents) {
-      const configured = agent.modelPrimary || defaultPrimary;
-      const runtime = agentStatuses[agent.id];
-      const resolved = runtime?.resolvedDefault || runtime?.defaultModel || configured;
-      const live = liveModels[agent.id]?.fullModel || null;
-      ensure(configured);
-      ensure(resolved);
-      ensure(live);
-    }
-
-    return map;
-  }, [
-    agents,
-    agentStatuses,
-    allowedModels,
-    defaultPrimary,
-    defaultResolved,
-    heartbeat?.model,
-    liveModels,
-    models,
-    providerAuthMap,
-    status?.imageFallbacks,
-    status?.imageModel,
-  ]);
-
-  const catalogOptionMap = useMemo(() => {
-    const map = new Map<string, ModelOption>();
-    for (const model of allModels) {
-      const provider = modelProvider(model.key);
-      const auth = providerAuthMap.get(provider);
-      map.set(model.key, {
-        key: model.key,
-        name: model.name || modelNameFromKey(model.key),
-        provider,
-        available: Boolean(model.available),
-        local: Boolean(model.local),
-        known: true,
-        ready: Boolean(model.local || model.available || allowedModels.has(model.key)),
-        authConnected: Boolean(auth?.connected),
-        authKind: auth?.authKind || null,
-        oauthStatus: auth?.oauthStatus || null,
-      });
-    }
-    return map;
-  }, [allModels, allowedModels, providerAuthMap]);
-
-  const allOptionMap = useMemo(() => {
-    const map = new Map<string, ModelOption>();
-    for (const [key, option] of catalogOptionMap.entries()) map.set(key, option);
-    for (const [key, option] of configuredOptionMap.entries()) map.set(key, option);
-    return map;
-  }, [catalogOptionMap, configuredOptionMap]);
-
-  const allModelOptions = useMemo(() => {
-    return [...allOptionMap.values()].sort((a, b) => {
-      const aReady = a.ready || a.local ? 0 : 1;
-      const bReady = b.ready || b.local ? 0 : 1;
-      if (aReady !== bReady) return aReady - bReady;
-      if (a.provider !== b.provider) return a.provider.localeCompare(b.provider);
-      return a.name.localeCompare(b.name);
-    });
-  }, [allOptionMap]);
-
-  const providerAuthSummary = useMemo(() => {
-    return [...providerAuthMap.entries()]
-      .map(([provider, data]) => ({
-        provider,
-        connected: data.connected,
-        authKind: data.authKind,
-        oauthStatus: data.oauthStatus,
-      }))
-      .sort((a, b) => a.provider.localeCompare(b.provider));
-  }, [providerAuthMap]);
-
-  const providerCatalogCounts = useMemo(() => {
-    const counts = new Map<string, { total: number; local: number }>();
-    for (const model of allModels) {
-      const provider = modelProvider(model.key);
-      const prev = counts.get(provider) || { total: 0, local: 0 };
-      counts.set(provider, {
-        total: prev.total + 1,
-        local: prev.local + (model.local ? 1 : 0),
-      });
-    }
-    return counts;
-  }, [allModels]);
-
-  const configInvalidDetected = useMemo(() => {
-    const combined = [apiWarning, allModelsWarning]
-      .map((entry) => String(entry || ""))
-      .join(" ")
-      .toLowerCase();
-    return combined.includes("config invalid");
-  }, [allModelsWarning, apiWarning]);
-
-  const availableProviders = useMemo(() => {
-    const providers = new Set<string>();
-    for (const row of providerAuthSummary) {
-      if (row.provider) providers.add(row.provider);
-    }
-    for (const option of allModelOptions) {
-      if (option.provider && option.provider !== "custom") providers.add(option.provider);
-    }
-    for (const store of agentAuthProfiles) {
-      for (const profile of store.profiles) {
-        if (profile.provider) providers.add(profile.provider);
-      }
-    }
-    return [...providers].sort((a, b) => a.localeCompare(b));
-  }, [agentAuthProfiles, allModelOptions, providerAuthSummary]);
-
-  const providerConfigMap = useMemo(() => {
-    const map = new Map<string, Record<string, unknown>>();
-    for (const entry of modelsCatalogConfig.providers) {
-      map.set(entry.provider, entry.config || {});
-    }
-    return map;
-  }, [modelsCatalogConfig.providers]);
-
-  const providerDraftOptions = useMemo(() => {
-    const options = new Set<string>();
-    for (const key of Object.keys(PROVIDER_CONFIG_TEMPLATES)) options.add(key);
-    for (const provider of availableProviders) options.add(provider);
-    for (const row of modelsCatalogConfig.providers) options.add(row.provider);
-    return [...options].sort((a, b) => a.localeCompare(b));
-  }, [availableProviders, modelsCatalogConfig.providers]);
-
-  const selectedOrderAgentProfiles = useMemo(() => {
-    const row = agentAuthProfiles.find((entry) => entry.agentId === orderAgentId);
-    if (!row) return [];
-    const ids: string[] = [];
-    const seen = new Set<string>();
-    for (const profile of row.profiles) {
-      if (profile.provider !== orderProvider) continue;
-      if (!profile.id || seen.has(profile.id)) continue;
-      seen.add(profile.id);
-      ids.push(profile.id);
-    }
-    ids.sort((a, b) => a.localeCompare(b));
-    return ids;
-  }, [agentAuthProfiles, orderAgentId, orderProvider]);
-
-  // Sync dropdown selections when data changes
-  useEffect(() => {
-    if (sortedAgents.length === 0) return;
-    if (!sortedAgents.some((agent) => agent.id === orderAgentId)) {
-      setOrderAgentId(sortedAgents[0].id);
-    }
-  }, [orderAgentId, sortedAgents]);
-
-  useEffect(() => {
-    if (availableProviders.length === 0) return;
-    if (!availableProviders.includes(orderProvider)) {
-      setOrderProvider(availableProviders[0]);
-    }
-  }, [availableProviders, orderProvider]);
-
-  useEffect(() => {
-    if (selectedOrderAgentProfiles.includes(orderSelectedProfileId)) return;
-    setOrderSelectedProfileId(selectedOrderAgentProfiles[0] || "");
-  }, [orderSelectedProfileId, selectedOrderAgentProfiles]);
-
-  const loadAuthOrder = useCallback(
-    async (agentId: string, provider: string) => {
-      if (!agentId || !provider) return;
-      setOrderLoading(true);
-      try {
-        const data = await postModelAction({
-          action: "get-auth-order",
-          agentId,
-          provider,
-        });
-        const authOrder = (data.authOrder || {}) as AuthOrderPayload;
-        const nextOrder = Array.isArray(authOrder.order)
-          ? authOrder.order.map((entry) => String(entry)).filter(Boolean)
-          : [];
-        setOrderDraft(nextOrder);
-        setOrderError(null);
-      } catch (err) {
-        setOrderError(err instanceof Error ? err.message : String(err));
-        setOrderDraft([]);
-      } finally {
-        setOrderLoading(false);
-      }
-    },
-    [postModelAction],
-  );
-
-  useEffect(() => {
-    if (!orderAgentId || !orderProvider) return;
-    loadAuthOrder(orderAgentId, orderProvider);
-  }, [loadAuthOrder, orderAgentId, orderProvider]);
-
-  // ── Action callbacks ──
-
-  const changeDefaultModel = useCallback(
-    async (nextModel: string) => {
-      if (!nextModel || nextModel === defaultPrimary) return;
-      const seed = defaultPrimary ? [defaultPrimary] : [];
-      const nextFallbacks = [
-        ...seed,
-        ...defaultFallbacks.filter(
-          (f) => f !== nextModel && (!defaultPrimary || f !== defaultPrimary),
-        ),
-      ];
-      await runAction(
-        { action: "reorder", primary: nextModel, fallbacks: nextFallbacks },
-        `Default model set to ${getModelDisplayName(nextModel, models, aliases)}`,
-        "defaults",
-      );
-    },
-    [aliases, defaultFallbacks, defaultPrimary, models, runAction],
-  );
-
-  const changeAgentModel = useCallback(
-    async (agent: AgentModelInfo, nextModel: string) => {
-      const currentConfigured = agent.modelPrimary || defaultPrimary;
-      if (!nextModel) return;
-      if (agent.usesDefaults && nextModel === defaultPrimary) return;
-      if (!agent.usesDefaults && currentConfigured === nextModel) return;
-      await runAction(
-        {
-          action: "set-agent-model",
-          agentId: agent.id,
-          primary: nextModel,
-          fallbacks: Array.isArray(agent.modelFallbacks) ? agent.modelFallbacks : null,
-        },
-        `${agent.name} now configured for ${getModelDisplayName(nextModel, models, aliases)}`,
-        `agent:${agent.id}`,
-      );
-    },
-    [aliases, defaultPrimary, models, runAction],
-  );
-
-  const resetAgentToDefaults = useCallback(
-    async (agent: AgentModelInfo) => {
-      if (agent.usesDefaults) return;
-      await runAction(
-        { action: "reset-agent-model", agentId: agent.id },
-        `${agent.name} now uses global defaults`,
-        `reset:${agent.id}`,
-      );
-    },
-    [runAction],
-  );
-
-  const addDefaultFallback = useCallback(
-    async (modelKey: string) => {
-      const key = String(modelKey || "").trim();
-      if (!key || key === defaultPrimary || defaultFallbacks.includes(key)) return;
-      await runAction(
-        { action: "set-fallbacks", fallbacks: [...defaultFallbacks, key] },
-        `Added fallback ${getModelDisplayName(key, models, aliases)}`,
-        "defaults:fallbacks",
-      );
-    },
-    [aliases, defaultFallbacks, defaultPrimary, models, runAction],
-  );
-
-  const removeDefaultFallback = useCallback(
-    async (modelKey: string) => {
-      const next = defaultFallbacks.filter((fallback) => fallback !== modelKey);
-      await runAction(
-        { action: "set-fallbacks", fallbacks: next },
-        `Removed fallback ${getModelDisplayName(modelKey, models, aliases)}`,
-        "defaults:fallbacks",
-      );
-    },
-    [aliases, defaultFallbacks, models, runAction],
-  );
-
-  const addAgentFallback = useCallback(
-    async (agent: AgentModelInfo, modelKey: string) => {
-      const key = String(modelKey || "").trim();
-      if (!key) return;
-      const primary = agent.modelPrimary || defaultPrimary;
-      const current = Array.isArray(agent.modelFallbacks) ? agent.modelFallbacks : [];
-      if (key === primary || current.includes(key)) return;
-      await runAction(
-        {
-          action: "set-agent-model",
-          agentId: agent.id,
-          primary,
-          fallbacks: [...current, key],
-        },
-        `${agent.name} fallback chain updated`,
-        `agent:fallback:${agent.id}`,
-      );
-    },
-    [defaultPrimary, runAction],
-  );
-
-  const removeAgentFallback = useCallback(
-    async (agent: AgentModelInfo, modelKey: string) => {
-      const primary = agent.modelPrimary || defaultPrimary;
-      const current = Array.isArray(agent.modelFallbacks) ? agent.modelFallbacks : [];
-      await runAction(
-        {
-          action: "set-agent-model",
-          agentId: agent.id,
-          primary,
-          fallbacks: current.filter((entry) => entry !== modelKey),
-        },
-        `${agent.name} fallback chain updated`,
-        `agent:fallback:${agent.id}`,
-      );
-    },
-    [defaultPrimary, runAction],
-  );
-
-  const addAllowedModel = useCallback(
-    async (modelKey: string) => {
-      const key = String(modelKey || "").trim();
-      if (!key || configuredAllowed.includes(key)) return;
-      await runAction(
-        { action: "add-allowed-model", model: key },
-        `Added ${getModelDisplayName(key, allModels, aliases)} to allowed models`,
-        "allowlist:add",
-        { restart: false, refreshCatalog: true },
-      );
-    },
-    [aliases, allModels, configuredAllowed, runAction],
-  );
-
-  const removeAllowedModel = useCallback(
-    async (modelKey: string) => {
-      const key = String(modelKey || "").trim();
-      if (!key) return;
-      await runAction(
-        { action: "remove-allowed-model", model: key },
-        `Removed ${getModelDisplayName(key, allModels, aliases)} from allowed models`,
-        "allowlist:remove",
-        { restart: false, refreshCatalog: true },
-      );
-    },
-    [aliases, allModels, runAction],
-  );
-
-  const scanModels = useCallback(async () => {
-    await runAction(
-      { action: "scan-models", noProbe: false },
-      "Model scan complete",
-      "catalog:scan",
-      { restart: false, refreshCatalog: true },
-    );
-  }, [runAction]);
-
-  const addOrderProfile = useCallback((profileId: string) => {
-    const id = String(profileId || "").trim();
-    if (!id) return;
-    setOrderDraft((current) => (current.includes(id) ? current : [...current, id]));
-  }, []);
-
-  const removeOrderProfile = useCallback((profileId: string) => {
-    setOrderDraft((current) => current.filter((id) => id !== profileId));
-  }, []);
-
-  const moveOrderProfile = useCallback((profileId: string, direction: -1 | 1) => {
-    setOrderDraft((current) => {
-      const index = current.indexOf(profileId);
-      if (index < 0) return current;
-      const nextIndex = index + direction;
-      if (nextIndex < 0 || nextIndex >= current.length) return current;
-      const next = [...current];
-      const [entry] = next.splice(index, 1);
-      next.splice(nextIndex, 0, entry);
-      return next;
-    });
-  }, []);
-
-  const saveAuthOrder = useCallback(async () => {
-    if (!orderAgentId || !orderProvider || orderDraft.length === 0) return;
-    setOrderBusy(true);
-    try {
-      await postModelAction({
-        action: "set-auth-order",
-        agentId: orderAgentId,
-        provider: orderProvider,
-        profileIds: orderDraft,
-      });
-      flash("Auth order override saved", "success");
-      await loadAuthOrder(orderAgentId, orderProvider);
-    } catch (err) {
-      flash(err instanceof Error ? err.message : String(err), "error");
-    } finally {
-      setOrderBusy(false);
-    }
-  }, [flash, loadAuthOrder, orderAgentId, orderDraft, orderProvider, postModelAction]);
-
-  const clearAuthOrder = useCallback(async () => {
-    if (!orderAgentId || !orderProvider) return;
-    setOrderBusy(true);
-    try {
-      await postModelAction({
-        action: "clear-auth-order",
-        agentId: orderAgentId,
-        provider: orderProvider,
-      });
-      flash("Auth order override cleared", "success");
-      await loadAuthOrder(orderAgentId, orderProvider);
-    } catch (err) {
-      flash(err instanceof Error ? err.message : String(err), "error");
-    } finally {
-      setOrderBusy(false);
-    }
-  }, [flash, loadAuthOrder, orderAgentId, orderProvider, postModelAction]);
-
-  const setImageModel = useCallback(
-    async (nextModel: string) => {
-      const current = status?.imageModel || "";
-      if (!nextModel || nextModel === current) return;
-      await runAction(
-        { action: "set-image-model", model: nextModel },
-        `Image model set to ${getFriendlyModelName(nextModel)}`,
-        "image:model",
-        { restart: false },
-      );
-    },
-    [runAction, status?.imageModel],
-  );
-
-  const addImageFallback = useCallback(
-    async (modelKey: string) => {
-      const key = String(modelKey || "").trim();
-      const current = status?.imageFallbacks || [];
-      const imagePrimary = status?.imageModel || "";
-      if (!key || key === imagePrimary || current.includes(key)) return;
-      await runAction(
-        { action: "add-image-fallback", model: key },
-        `Added image fallback ${getFriendlyModelName(key)}`,
-        "image:fallbacks",
-        { restart: false },
-      );
-    },
-    [runAction, status?.imageFallbacks, status?.imageModel],
-  );
-
-  const removeImageFallback = useCallback(
-    async (modelKey: string) => {
-      const key = String(modelKey || "").trim();
-      if (!key) return;
-      await runAction(
-        { action: "remove-image-fallback", model: key },
-        `Removed image fallback ${getFriendlyModelName(key)}`,
-        "image:fallbacks",
-        { restart: false },
-      );
-    },
-    [runAction],
-  );
-
-  const setCatalogMode = useCallback(
-    async (mode: string) => {
-      const next = mode.trim().toLowerCase();
-      if (next !== "merge" && next !== "replace") return;
-      if (next === (modelsCatalogConfig.mode || "merge")) return;
-      await runAction(
-        { action: "set-models-mode", mode: next },
-        `Provider catalog mode set to ${next}`,
-        "providers:mode",
-        { restart: true, refreshCatalog: true },
-      );
-    },
-    [modelsCatalogConfig.mode, runAction],
-  );
-
-  const providerDraftResolvedId = useMemo(() => {
-    if (providerDraftId === "__custom__") {
-      return providerDraftCustomId.trim().toLowerCase();
-    }
-    return providerDraftId.trim().toLowerCase();
-  }, [providerDraftCustomId, providerDraftId]);
-
-  const loadProviderDraft = useCallback(
-    (provider: string) => {
-      const key = provider.trim().toLowerCase();
-      if (!key) return;
-      const existing = modelsCatalogConfig.providers.find(
-        (entry) => entry.provider === key,
-      );
-      const fallbackTemplate =
-        PROVIDER_CONFIG_TEMPLATES[key] || {
-          baseUrl: "",
-          api: "openai-completions",
-        };
-      setProviderDraftError(null);
-      setProviderDraftJson(JSON.stringify(existing?.config || fallbackTemplate, null, 2));
-    },
-    [modelsCatalogConfig.providers],
-  );
-
-  const saveProviderConfig = useCallback(async () => {
-    const provider = providerDraftResolvedId;
-    if (!provider) {
-      setProviderDraftError("Choose a provider id first.");
-      return;
-    }
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(providerDraftJson);
-    } catch (err) {
-      setProviderDraftError(
-        err instanceof Error ? err.message : "Invalid JSON",
-      );
-      return;
-    }
-    if (!parsed || Array.isArray(parsed) || typeof parsed !== "object") {
-      setProviderDraftError("Provider config must be a JSON object.");
-      return;
-    }
-    setProviderDraftError(null);
-    await runAction(
-      {
-        action: "set-provider-config",
-        provider,
-        config: parsed as Record<string, unknown>,
-      },
-      `Saved provider override for ${provider}`,
-      `providers:set:${provider}`,
-      { restart: true, refreshCatalog: true },
-    );
-  }, [providerDraftJson, providerDraftResolvedId, runAction]);
-
-  const removeProviderConfig = useCallback(
-    async (provider: string) => {
-      const key = provider.trim().toLowerCase();
-      if (!key) return;
-      await runAction(
-        { action: "remove-provider-config", provider: key },
-        `Removed provider override for ${key}`,
-        `providers:remove:${key}`,
-        { restart: true, refreshCatalog: true },
-      );
-    },
-    [runAction],
-  );
-
-  const setHeartbeatModel = useCallback(
-    async (model: string) => {
-      await runAction(
-        { action: "set-heartbeat", model },
-        model
-          ? `Heartbeat model set to ${getFriendlyModelName(model)}`
-          : "Heartbeat model reset to inherited default",
-        "heartbeat:model",
-        { restart: false },
-      );
-    },
-    [runAction],
-  );
-
-  const setHeartbeatEvery = useCallback(
-    async (every: string) => {
-      const nextEvery = every.trim();
-      if (!nextEvery) {
-        flash("Heartbeat interval is required", "error");
-        return;
-      }
-      if (nextEvery === (heartbeat?.every || "")) return;
-      await runAction(
-        { action: "set-heartbeat", every: nextEvery },
-        `Heartbeat interval set to ${nextEvery}`,
-        "heartbeat:every",
-        { restart: false },
-      );
-    },
-    [flash, heartbeat?.every, runAction],
-  );
-
-  const applyProviderTemplate = useCallback(() => {
-    const provider = providerDraftResolvedId;
-    if (!provider) return;
-    const template = PROVIDER_CONFIG_TEMPLATES[provider] || {
-      baseUrl: "",
-      api: "openai-completions",
-    };
-    setProviderDraftError(null);
-    setProviderDraftJson(JSON.stringify(template, null, 2));
-  }, [providerDraftResolvedId]);
-
-  useEffect(() => {
-    if (providerDraftId) return;
-    const preferred =
-      modelsCatalogConfig.providers[0]?.provider ||
-      availableProviders[0] ||
-      "openrouter";
-    setProviderDraftId(preferred);
-    loadProviderDraft(preferred);
-  }, [
-    availableProviders,
-    loadProviderDraft,
-    modelsCatalogConfig.providers,
-    providerDraftId,
-  ]);
-
-  useEffect(() => {
-    setHeartbeatEveryDraft(heartbeat?.every || "1h");
-  }, [heartbeat?.every]);
-
-  const providerDraftHasOverride = useMemo(
-    () => providerConfigMap.has(providerDraftResolvedId),
-    [providerConfigMap, providerDraftResolvedId],
-  );
-
-  // ── Model picker handler ──
-
-  const handlePickerSelect = useCallback(
-    (fullModel: string) => {
-      if (!pickerTarget) return;
-      setPickerTarget(null);
-      switch (pickerTarget.kind) {
-        case "default":
-          void changeDefaultModel(fullModel);
-          break;
-        case "default-fallback":
-          void addDefaultFallback(fullModel);
-          break;
-        case "image-model":
-          void setImageModel(fullModel);
-          break;
-        case "image-fallback":
-          void addImageFallback(fullModel);
-          break;
-        case "heartbeat-model":
-          void setHeartbeatModel(fullModel);
-          break;
-        case "agent":
-          void changeAgentModel(pickerTarget.agent, fullModel);
-          break;
-        case "agent-fallback":
-          void addAgentFallback(pickerTarget.agent, fullModel);
-          break;
-        case "allowlist":
-          void addAllowedModel(fullModel);
-          break;
-      }
-    },
-    [
-      addAllowedModel,
-      addDefaultFallback,
-      addImageFallback,
-      addAgentFallback,
-      changeAgentModel,
-      changeDefaultModel,
-      pickerTarget,
-      setHeartbeatModel,
-      setImageModel,
-    ],
-  );
-
-  const imageCapableModelKeys = useMemo(() => {
-    const keys = new Set<string>();
-    const collect = (rows: ModelInfo[]) => {
-      for (const row of rows) {
-        const input = String(row.input || "").toLowerCase();
-        if (input.includes("image")) keys.add(row.key);
-      }
-    };
-    collect(models);
-    collect(allModels);
-    if (status?.imageModel) keys.add(status.imageModel);
-    for (const fallback of status?.imageFallbacks || []) keys.add(fallback);
-    return keys;
-  }, [allModels, models, status?.imageFallbacks, status?.imageModel]);
-
-  const pickerModels = useMemo(() => {
-    if (!pickerTarget) return allModelOptions;
-    if (pickerTarget.kind !== "image-model" && pickerTarget.kind !== "image-fallback") {
-      return allModelOptions;
-    }
-    const filtered = allModelOptions.filter(
-      (option) => imageCapableModelKeys.has(option.key) || !option.known,
-    );
-    return filtered.length > 0 ? filtered : allModelOptions;
-  }, [allModelOptions, imageCapableModelKeys, pickerTarget]);
-
-  // Compute picker exclude list
-  const pickerExcludeModels = useMemo(() => {
-    if (!pickerTarget) return undefined;
-    switch (pickerTarget.kind) {
-      case "default-fallback":
-        return [defaultPrimary, ...defaultFallbacks];
-      case "image-fallback":
-        return [status?.imageModel || "", ...(status?.imageFallbacks || [])].filter(Boolean);
-      case "agent-fallback": {
-        const agent = pickerTarget.agent;
-        const primary = agent.modelPrimary || defaultPrimary;
-        const fbs = Array.isArray(agent.modelFallbacks) ? agent.modelFallbacks : [];
-        return [primary, ...fbs];
-      }
-      case "allowlist":
-        return configuredAllowed;
-      default:
-        return undefined;
-    }
-  }, [
-    configuredAllowed,
-    defaultFallbacks,
-    defaultPrimary,
-    pickerTarget,
-    status?.imageFallbacks,
-    status?.imageModel,
-  ]);
-
-  const pickerTitle = useMemo(() => {
-    if (!pickerTarget) return "Choose Model";
-    switch (pickerTarget.kind) {
-      case "default":
-        return "Choose Default Model";
-      case "default-fallback":
-        return "Add Fallback Model";
-      case "image-model":
-        return "Choose Image Model";
-      case "image-fallback":
-        return "Add Image Fallback";
-      case "heartbeat-model":
-        return "Choose Heartbeat Model";
-      case "agent":
-        return `Choose Model for ${pickerTarget.agent.name}`;
-      case "agent-fallback":
-        return `Add Fallback for ${pickerTarget.agent.name}`;
-      case "allowlist":
-        return "Add to Allowlist";
-    }
-  }, [pickerTarget]);
-
-  // ── Derived hero data ──
-
-  const mainAgent = agents.find((agent) => agent.id === "main") || null;
-  const mainHasOverride = Boolean(mainAgent && !mainAgent.usesDefaults);
-  const activeMeta = getModelMeta(defaultResolved) || getModelMeta(defaultPrimary);
-  const activeProviderKey = modelProvider(defaultResolved || defaultPrimary);
-  const activeProviderAuth = providerAuthMap.get(activeProviderKey);
-  const activeProviderConnected = activeProviderAuth?.connected ?? false;
-  const imageModel = status?.imageModel || "";
-  const imageFallbacks = status?.imageFallbacks || [];
-  const heartbeatModel = heartbeat?.model || "";
-  const heartbeatEvery = heartbeat?.every || "1h";
-
-  // ── Loading / error states ──
-
-  if (summaryLoading && !status) {
+  if (loading) {
     return (
-      <SectionLayout>
-        <LoadingState label="Loading models..." />
-      </SectionLayout>
-    );
-  }
-
-  if (!status) {
-    return (
-      <div className="flex flex-1 items-center justify-center text-sm text-red-400">
-        Failed to load model configuration
+      <div className="flex flex-col items-center gap-3 py-14">
+        <Loader2 className="h-6 w-6 animate-spin text-[#34d399]" />
+        <p className="text-xs text-[#7a8591]">Loading available models...</p>
       </div>
     );
   }
 
-  const connectedProviderCount = providerAuthSummary.filter((p) => p.connected).length;
-  const hasCredentialProviders = providerAuthSummary.some(
-    (p) => p.provider !== "ollama" && p.provider !== "vllm" && p.provider !== "lmstudio",
-  );
-
-  // Providers that are known but not connected (candidates for inline connect flow)
-  const LOCAL_PROVIDERS = new Set(["ollama", "vllm", "lmstudio"]);
-  const disconnectedProviders = providerAuthSummary
-    .filter((p) => !p.connected && !LOCAL_PROVIDERS.has(p.provider))
-    .map((p) => p.provider);
-  // Also include well-known providers that aren't even in the auth summary yet
-  const knownInSummary = new Set(providerAuthSummary.map((p) => p.provider));
-  const connectableProviders = [
-    ...disconnectedProviders,
-    ...Object.keys(CONNECT_PROVIDER_META).filter(
-      (p) => p !== "custom" && !knownInSummary.has(p) && !LOCAL_PROVIDERS.has(p),
-    ),
-    // Always show custom endpoint as last option
-    "custom",
-  ];
-  const providerSetupOptions = connectableProviders.filter(
-    (provider) => provider !== "custom" && Boolean(CONNECT_PROVIDER_META[provider]),
-  );
+  if (models.length === 0) {
+    return (
+      <div className="flex flex-col items-center gap-2 py-14 text-center">
+        <AlertCircle className="h-8 w-8 text-[#3d4752]" />
+        <p className="text-sm text-[#a8b0ba]">No models found</p>
+        <p className="text-xs text-[#7a8591]">The provider may not have returned a model list.</p>
+      </div>
+    );
+  }
 
   return (
-    <SectionLayout>
-      <SectionHeader
-        title="Models"
-        description="Pick a model family, choose which provider powers it, and keep the result saved in OpenClaw."
-        actions={
-          <div className="flex items-center gap-2">
-            <ApiWarningBadge warning={apiWarning} degraded={apiDegraded} />
+    <div className="flex flex-col">
+      {/* Search */}
+      <div className="sticky top-0 border-b border-[#2c343d] bg-[#171a1d] px-5 py-3">
+        <div className="relative">
+          <Search className="absolute left-3 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-[#3d4752]" />
+          <input
+            type="text"
+            value={query}
+            onChange={(e) => setQuery(e.target.value)}
+            placeholder="Search models..."
+            className="w-full rounded-lg border border-[#2c343d] bg-[#15191d] py-2 pl-9 pr-3 text-sm text-[#f5f7fa] placeholder-[#3d4752] focus:border-[#34d399]/40 focus:outline-none focus:ring-2 focus:ring-[#34d399]/20"
+          />
+        </div>
+        <p className="mt-1.5 text-[11px] text-[#7a8591]">
+          {filtered.length} model{filtered.length !== 1 ? "s" : ""}
+        </p>
+      </div>
+
+      {/* List */}
+      <div className="max-h-72 overflow-y-auto">
+        {filtered.length === 0 ? (
+          <p className="py-8 text-center text-xs text-[#7a8591]">No models match your search</p>
+        ) : (
+          <div className="p-2">
+            {filtered.map((m) => {
+              const friendlyName = getFriendlyModelName(m.id);
+              const displayName = friendlyName !== m.id ? friendlyName : (m.name || m.id);
+              const isActive = m.id === currentModel;
+              return (
+                <button
+                  key={m.id}
+                  type="button"
+                  onClick={() => void onSelect(m.id)}
+                  className={cn(
+                    "group flex w-full items-center gap-3 rounded-lg px-3 py-2.5 text-left transition-colors",
+                    isActive
+                      ? "bg-[#34d399]/10"
+                      : "hover:bg-[#20252a]"
+                  )}
+                >
+                  <div className="flex h-5 w-5 shrink-0 items-center justify-center">
+                    {isActive ? (
+                      <Check className="h-4 w-4 text-[#34d399]" strokeWidth={2.5} />
+                    ) : (
+                      <div className="h-1.5 w-1.5 rounded-full bg-[#3d4752] transition-colors group-hover:bg-[#7a8591]" />
+                    )}
+                  </div>
+                  <div className="min-w-0 flex-1">
+                    <span
+                      className={cn(
+                        "block truncate text-sm font-medium",
+                        isActive ? "text-[#34d399]" : "text-[#f5f7fa]"
+                      )}
+                    >
+                      {displayName}
+                    </span>
+                    {displayName !== m.id && (
+                      <span className="block truncate font-mono text-[11px] text-[#7a8591]">
+                        {m.id}
+                      </span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ── Add Provider Wizard ─────────────────────────── */
+
+function AddProviderWizard({
+  onClose,
+  onDone,
+}: {
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const [wizard, setWizard] = useState<WizardState>({
+    step: "pick",
+    providerId: null,
+    apiKey: "",
+    error: null,
+    models: [],
+    loadingModels: false,
+  });
+
+  const keyInputRef = useRef<HTMLInputElement>(null);
+  const provider = wizard.providerId ? findProvider(wizard.providerId) : null;
+
+  const stepTitle: Record<WizardStep, string> = {
+    pick: "Add an AI provider",
+    key: "Enter your API key",
+    validating: "Validating key...",
+    "pick-model": "Choose your model",
+    done: "All set!",
+  };
+
+  function pickProvider(id: string) {
+    setWizard((s) => ({ ...s, step: "key", providerId: id, apiKey: "", error: null }));
+    setTimeout(() => keyInputRef.current?.focus(), 80);
+  }
+
+  function goBack() {
+    if (wizard.step === "validating") return;
+    setWizard((s) => ({
+      ...s,
+      step: "pick",
+      providerId: null,
+      apiKey: "",
+      error: null,
+      models: [],
+    }));
+  }
+
+  async function handleValidate() {
+    if (!wizard.providerId || !wizard.apiKey.trim()) {
+      setWizard((s) => ({ ...s, error: "Please paste your API key before continuing." }));
+      return;
+    }
+
+    setWizard((s) => ({ ...s, step: "validating", error: null }));
+
+    try {
+      const saveRes = await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          action: "auth-provider",
+          provider: wizard.providerId,
+          token: wizard.apiKey.trim(),
+        }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const saveData = await saveRes.json();
+
+      if (!saveData.ok) {
+        setWizard((s) => ({
+          ...s,
+          step: "key",
+          error:
+            saveData.error ??
+            "API key validation failed. Double-check you copied it correctly.",
+        }));
+        return;
+      }
+
+      // Fetch available models
+      setWizard((s) => ({ ...s, step: "pick-model", loadingModels: true, models: [] }));
+
+      const modelsRes = await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "list-models", provider: wizard.providerId }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const modelsData = await modelsRes.json();
+
+      setWizard((s) => ({
+        ...s,
+        models: modelsData.ok ? (modelsData.models ?? []) : [],
+        loadingModels: false,
+        error: null,
+      }));
+    } catch {
+      setWizard((s) => ({
+        ...s,
+        step: "key",
+        error: "Network error or request timed out. Check your connection and try again.",
+        loadingModels: false,
+      }));
+    }
+  }
+
+  async function handleSetModel(modelId: string) {
+    try {
+      await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "set-primary", model: modelId }),
+        signal: AbortSignal.timeout(10000),
+      });
+    } catch {
+      // Provider is already saved — model can be changed later
+    }
+    setWizard((s) => ({ ...s, step: "done" }));
+    onDone();
+  }
+
+  const canGoBack =
+    wizard.step === "key" || wizard.step === "pick-model" || wizard.step === "done";
+
+  return (
+    <div className="animate-backdrop-in fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm sm:items-center">
+      <div className="animate-modal-in mx-0 flex w-full max-w-lg flex-col rounded-t-2xl border border-[#2c343d] bg-[#171a1d] shadow-2xl sm:mx-4 sm:rounded-2xl">
+        {/* Header */}
+        <div className="flex shrink-0 items-center gap-3 border-b border-[#2c343d] px-5 py-4">
+          {canGoBack && (
             <button
               type="button"
-              onClick={() => {
-                void fetchSummary();
-                if (detailsRequested) void fetchAdvancedDetails(true);
-                if (allModelsRequested) void fetchAllModels(true);
-                if (auditRequested) void fetchAudit(true);
-              }}
-              disabled={Boolean(busyKey)}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-white px-3 py-1.5 text-sm font-medium text-stone-600 transition-colors hover:bg-stone-100 hover:text-stone-900 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40 dark:border-[#2c343d] dark:bg-[#171a1d] dark:text-[#c7d0d9] dark:hover:bg-[#1e2227] dark:hover:text-[#f5f7fa]"
+              onClick={goBack}
+              disabled={wizard.step === "validating"}
+              aria-label="Go back"
+              className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#a8b0ba] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa] disabled:opacity-40"
             >
-              {busyKey || summaryLoading ? <BusyDots /> : <RefreshCw className="h-3.5 w-3.5" />}
-              Refresh
+              <ChevronLeft className="h-4 w-4" />
             </button>
-          </div>
-        }
-      />
-
-      <SectionBody width="narrow" padding="roomy" innerClassName="space-y-5">
-        {configInvalidDetected && (
-          <section className="rounded-xl border border-red-500/25 bg-red-500/8 p-4">
-            <div className="flex items-start gap-2">
-              <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-red-500" />
-              <div className="space-y-1">
-                <p className="text-xs font-semibold uppercase tracking-wider text-red-600 dark:text-red-300">
-                  Config Validation Failed
-                </p>
-                <p className="text-sm text-red-700 dark:text-red-200">
-                  OpenClaw reported an invalid config, so model discovery is currently partial.
-                </p>
-                <p className="text-xs text-red-700/80 dark:text-red-200/80">
-                  Fix command: <code className="font-mono">openclaw doctor --fix</code>
-                </p>
-              </div>
-            </div>
-          </section>
-        )}
-
-        {/* ━━━ SECTION 1: Active Model ━━━ */}
-        <section className="rounded-2xl border border-border p-5 bg-card">
-          <div className="flex items-center gap-2 mb-4">
-            <Sparkles className="h-4 w-4 text-[var(--accent-brand-text)]" />
-            <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-              Active Model
-            </h2>
-          </div>
-
-          {mainHasOverride && mainAgent && (
-            <div className="mb-4 rounded-xl border border-amber-500/20 bg-amber-500/5 p-3">
-              <p className="text-sm font-medium text-foreground">
-                {mainAgent.name} is currently using its own model setup.
+          )}
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-semibold text-[#f5f7fa]">{stepTitle[wizard.step]}</h2>
+            {wizard.step === "pick" && (
+              <p className="mt-0.5 text-xs text-[#7a8591]">
+                Connect an AI provider to power your assistant
               </p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                The shared default below is for agents that follow the default setup. {mainAgent.name} is currently set to {getFriendlyModelName(mainAgent.modelPrimary || defaultPrimary)} separately, so change that in Per-Agent if you want this agent itself to switch.
+            )}
+            {wizard.step === "key" && provider && (
+              <p className="mt-0.5 text-xs text-[#7a8591]">
+                Paste your {provider.name} API key below
               </p>
+            )}
+            {wizard.step === "pick-model" && (
+              <p className="mt-0.5 text-xs text-[#7a8591]">
+                Select which model your assistant will use
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#7a8591] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa]"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Scrollable body */}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {/* Step: pick provider */}
+          {wizard.step === "pick" && (
+            <div className="grid grid-cols-1 gap-3 p-5">
+              {PROVIDERS.map((p) => (
+                <button
+                  key={p.id}
+                  type="button"
+                  onClick={() => pickProvider(p.id)}
+                  className="group flex w-full items-center gap-4 rounded-xl border border-[#2c343d] bg-[#15191d] p-4 text-left transition-all hover:border-[#3d4752] hover:bg-[#1d2227] focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-[#34d399]/30"
+                >
+                  <ProviderAvatar name={p.name} />
+                  <div className="min-w-0 flex-1">
+                    <span className="text-sm font-semibold text-[#f5f7fa]">{p.name}</span>
+                    <p className="mt-0.5 text-xs text-[#7a8591]">{p.hint}</p>
+                  </div>
+                  <ChevronRight className="h-4 w-4 shrink-0 text-[#3d4752] transition-colors group-hover:text-[#7a8591]" />
+                </button>
+              ))}
             </div>
           )}
 
-          {/* Hero card */}
-          <div className="rounded-xl border border-stone-200 bg-white p-5 shadow-sm dark:border-[#2c343d] dark:bg-[#171a1d]">
-            <div className="flex flex-wrap items-start justify-between gap-3">
-              <div className="min-w-0">
-                <p className="text-lg font-semibold text-foreground">
-                  {getFriendlyModelName(defaultResolved)}
-                </p>
-                <div className="mt-1.5 flex flex-wrap items-center gap-2">
-                  <span className="rounded-md border border-foreground/10 bg-muted/50 px-2 py-0.5 text-xs font-medium text-muted-foreground">
-                    {getProviderDisplayName(modelProvider(defaultResolved))}
+          {/* Step: enter API key */}
+          {wizard.step === "key" && provider && (
+            <div className="space-y-4 p-5">
+              {/* Instructions card */}
+              <div className="rounded-xl border border-[#2c343d] bg-[#15191d] p-4">
+                <div className="mb-3 flex items-center gap-2">
+                  <Key className="h-3.5 w-3.5 shrink-0 text-[#34d399]" />
+                  <span className="text-xs font-semibold text-[#d6dce3]">
+                    How to get your {provider.name} API key
                   </span>
-                  {activeMeta && (
-                    <>
-                      <span className="text-xs text-muted-foreground">
-                        {activeMeta.priceTier}
-                      </span>
-                      <span className="text-xs text-muted-foreground">
-                        {activeMeta.contextWindow} context
-                      </span>
-                    </>
-                  )}
                 </div>
-                {activeMeta?.description && (
-                  <p className="mt-2 text-xs text-muted-foreground/80 italic">
-                    &ldquo;{activeMeta.description}&rdquo;
+                <ol className="space-y-2.5">
+                  <li className="flex items-start gap-3">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#20252a] text-[10px] font-semibold text-[#7a8591] ring-1 ring-[#2c343d]">
+                      1
+                    </span>
+                    <p className="pt-0.5 text-xs leading-relaxed text-[#a8b0ba]">
+                      Go to the{" "}
+                      <a
+                        href={provider.url}
+                        target="_blank"
+                        rel="noopener noreferrer"
+                        className="inline-flex items-center gap-1 text-[#34d399] underline-offset-2 hover:underline"
+                      >
+                        {provider.name} API keys page
+                        <ExternalLink className="h-2.5 w-2.5" />
+                      </a>
+                    </p>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#20252a] text-[10px] font-semibold text-[#7a8591] ring-1 ring-[#2c343d]">
+                      2
+                    </span>
+                    <p className="pt-0.5 text-xs leading-relaxed text-[#a8b0ba]">
+                      Create a new API key and copy it
+                    </p>
+                  </li>
+                  <li className="flex items-start gap-3">
+                    <span className="flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-[#20252a] text-[10px] font-semibold text-[#7a8591] ring-1 ring-[#2c343d]">
+                      3
+                    </span>
+                    <p className="pt-0.5 text-xs leading-relaxed text-[#a8b0ba]">
+                      Paste it in the field below and click Validate
+                    </p>
+                  </li>
+                </ol>
+              </div>
+
+              {/* Key input */}
+              <div className="space-y-2">
+                <label
+                  htmlFor="models-api-key-input"
+                  className="block text-xs font-medium text-[#d6dce3]"
+                >
+                  API Key
+                  {provider.keyPrefix && (
+                    <span className="ml-1.5 font-normal text-[#7a8591]">
+                      (starts with{" "}
+                      <code className="font-mono text-[#a8b0ba]">{provider.keyPrefix}</code>)
+                    </span>
+                  )}
+                </label>
+                <input
+                  ref={keyInputRef}
+                  id="models-api-key-input"
+                  type="password"
+                  value={wizard.apiKey}
+                  onChange={(e) =>
+                    setWizard((s) => ({ ...s, apiKey: e.target.value, error: null }))
+                  }
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") void handleValidate();
+                  }}
+                  placeholder={
+                    provider.keyPrefix ? `${provider.keyPrefix}...` : "Paste your API key here"
+                  }
+                  autoComplete="off"
+                  spellCheck={false}
+                  className={cn(
+                    "w-full rounded-lg border bg-[#15191d] px-3 py-2.5 font-mono text-sm text-[#f5f7fa] placeholder-[#3d4752]",
+                    "transition-colors focus:outline-none focus:ring-2",
+                    wizard.error
+                      ? "border-red-500/40 focus:border-red-500/40 focus:ring-red-500/20"
+                      : "border-[#2c343d] focus:border-[#34d399]/40 focus:ring-[#34d399]/20"
+                  )}
+                />
+                {wizard.error && (
+                  <p className="flex items-center gap-1.5 text-xs text-red-400">
+                    <AlertCircle className="h-3 w-3 shrink-0" />
+                    {wizard.error}
                   </p>
                 )}
+                <p className="flex items-start gap-1.5 text-[11px] leading-relaxed text-[#7a8591]">
+                  <Check className="mt-0.5 h-3 w-3 shrink-0 text-[#34d399]" />
+                  Your key is stored only on this device and never sent to our servers.
+                </p>
               </div>
-              <StatusPill
-                tone={!activeProviderConnected ? "warn" : defaultResolved === defaultPrimary ? "good" : "warn"}
-                label={!activeProviderConnected ? "No credentials" : defaultResolved === defaultPrimary ? "Active" : "Fallback active"}
-              />
             </div>
+          )}
 
-            {!activeProviderConnected && activeProviderKey && (
-              <div className="mt-3 rounded-lg border border-amber-500/20 bg-amber-500/5 p-3">
-                <p className="text-xs font-medium text-amber-600 dark:text-amber-200">
-                  {getProviderDisplayName(activeProviderKey)} is not connected
+          {/* Step: validating */}
+          {wizard.step === "validating" && (
+            <div className="flex flex-col items-center gap-4 py-14">
+              <div className="relative flex h-16 w-16 items-center justify-center">
+                <div className="absolute inset-0 rounded-full bg-[#34d399]/10" />
+                <Loader2 className="h-8 w-8 animate-spin text-[#34d399]" />
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-medium text-[#f5f7fa]">Checking your key...</p>
+                <p className="mt-1 text-xs text-[#7a8591]">This only takes a moment</p>
+              </div>
+            </div>
+          )}
+
+          {/* Step: pick-model */}
+          {wizard.step === "pick-model" && (
+            <ModelList
+              models={wizard.models}
+              loading={wizard.loadingModels}
+              currentModel={null}
+              onSelect={handleSetModel}
+            />
+          )}
+
+          {/* Step: done */}
+          {wizard.step === "done" && (
+            <div className="flex flex-col items-center gap-5 px-5 py-10">
+              <div className="relative flex h-16 w-16 items-center justify-center">
+                <div className="absolute inset-0 rounded-full bg-emerald-500/15" />
+                <Check className="h-8 w-8 text-emerald-400" strokeWidth={2.5} />
+              </div>
+              <div className="text-center">
+                <p className="text-sm font-semibold text-[#f5f7fa]">Provider connected!</p>
+                <p className="mt-1 text-xs leading-relaxed text-[#7a8591]">
+                  Your AI model is active and ready to use.
                 </p>
-                <p className="mt-0.5 text-xs text-amber-500/70 dark:text-amber-400/60">
-                  Add an API key below to start using this model.
-                </p>
+              </div>
+            </div>
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="shrink-0 border-t border-[#2c343d] px-5 py-4">
+          {wizard.step === "pick" && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full rounded-lg border border-[#2c343d] bg-[#20252a] px-4 py-2.5 text-sm font-medium text-[#a8b0ba] transition-colors hover:border-[#3d4752] hover:text-[#f5f7fa]"
+            >
+              Cancel
+            </button>
+          )}
+
+          {wizard.step === "key" && (
+            <button
+              type="button"
+              onClick={() => void handleValidate()}
+              disabled={!wizard.apiKey.trim()}
+              className="w-full rounded-lg bg-[#34d399] px-4 py-2.5 text-sm font-semibold text-[#0d1117] transition-all hover:bg-[#2dbe8c] disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              Validate &amp; Continue
+            </button>
+          )}
+
+          {wizard.step === "pick-model" && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full rounded-lg border border-[#2c343d] bg-[#20252a] px-4 py-2.5 text-sm font-medium text-[#a8b0ba] transition-colors hover:border-[#3d4752] hover:text-[#f5f7fa]"
+            >
+              Skip for now
+            </button>
+          )}
+
+          {wizard.step === "done" && (
+            <button
+              type="button"
+              onClick={onClose}
+              className="w-full rounded-lg bg-[#34d399] px-4 py-2.5 text-sm font-semibold text-[#0d1117] transition-all hover:bg-[#2dbe8c]"
+            >
+              Done
+            </button>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Model Picker Modal (from "Pick model" on provider cards) ── */
+
+function ModelPickerModal({
+  provider,
+  currentModel,
+  onClose,
+  onSelect,
+}: {
+  provider: Provider;
+  currentModel: string | null;
+  onClose: () => void;
+  onSelect: () => void;
+}) {
+  const [models, setModels] = useState<ModelItem[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [fetchError, setFetchError] = useState<string | null>(null);
+
+  const fetchModels = useCallback(async () => {
+    setLoading(true);
+    setFetchError(null);
+    try {
+      const res = await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "list-models", provider: provider.id }),
+        signal: AbortSignal.timeout(10000),
+      });
+      const data = await res.json();
+      if (data.ok) {
+        setModels(data.models ?? []);
+      } else {
+        setFetchError(data.error ?? "Could not load models.");
+      }
+    } catch {
+      setFetchError("Network error or request timed out.");
+    } finally {
+      setLoading(false);
+    }
+  }, [provider.id]);
+
+  // Fetch once on mount
+  const didFetch = useRef(false);
+  if (!didFetch.current) {
+    didFetch.current = true;
+    void fetchModels();
+  }
+
+  async function handleSelect(modelId: string) {
+    try {
+      await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "set-primary", model: modelId }),
+        signal: AbortSignal.timeout(10000),
+      });
+      onSelect();
+    } catch {
+      setFetchError("Could not save model selection. Try again.");
+    }
+  }
+
+  return (
+    <div className="animate-backdrop-in fixed inset-0 z-50 flex items-end justify-center bg-black/60 backdrop-blur-sm sm:items-center">
+      <div className="animate-modal-in mx-0 flex w-full max-w-lg flex-col rounded-t-2xl border border-[#2c343d] bg-[#171a1d] shadow-2xl sm:mx-4 sm:rounded-2xl">
+        {/* Header */}
+        <div className="flex shrink-0 items-center gap-3 border-b border-[#2c343d] px-5 py-4">
+          <ProviderAvatar name={provider.name} />
+          <div className="min-w-0 flex-1">
+            <h2 className="text-sm font-semibold text-[#f5f7fa]">{provider.name} models</h2>
+            <p className="mt-0.5 text-xs text-[#7a8591]">
+              Click any model to make it active
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={onClose}
+            aria-label="Close"
+            className="flex h-7 w-7 shrink-0 items-center justify-center rounded-lg text-[#7a8591] transition-colors hover:bg-[#20252a] hover:text-[#f5f7fa]"
+          >
+            <X className="h-4 w-4" />
+          </button>
+        </div>
+
+        {/* Body */}
+        <div className="min-h-0 flex-1 overflow-y-auto">
+          {fetchError ? (
+            <div className="flex flex-col items-center gap-3 py-12 text-center">
+              <AlertCircle className="h-8 w-8 text-[#3d4752]" />
+              <p className="text-sm text-[#a8b0ba]">{fetchError}</p>
+              <button
+                type="button"
+                onClick={() => void fetchModels()}
+                className="mt-1 rounded-lg border border-[#2c343d] px-3 py-1.5 text-xs text-[#a8b0ba] hover:border-[#3d4752] hover:text-[#f5f7fa]"
+              >
+                Retry
+              </button>
+            </div>
+          ) : (
+            <ModelList
+              models={models}
+              loading={loading}
+              currentModel={currentModel}
+              onSelect={handleSelect}
+            />
+          )}
+        </div>
+
+        {/* Footer */}
+        <div className="shrink-0 border-t border-[#2c343d] px-5 py-4">
+          <button
+            type="button"
+            onClick={onClose}
+            className="w-full rounded-lg border border-[#2c343d] bg-[#20252a] px-4 py-2.5 text-sm font-medium text-[#a8b0ba] transition-colors hover:border-[#3d4752] hover:text-[#f5f7fa]"
+          >
+            Close
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ── Remove button (double-click confirm) ───────── */
+
+function RemoveButton({ onRemove }: { onRemove: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  function handleClick() {
+    if (confirming) {
+      if (timerRef.current) clearTimeout(timerRef.current);
+      onRemove();
+      setConfirming(false);
+    } else {
+      setConfirming(true);
+      timerRef.current = setTimeout(() => setConfirming(false), 3000);
+    }
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={handleClick}
+      className={cn(
+        "flex items-center gap-1.5 rounded-lg border px-2.5 py-1.5 text-xs font-medium transition-all",
+        confirming
+          ? "border-red-500/30 bg-red-500/10 text-red-400 hover:bg-red-500/20"
+          : "border-[#2c343d] bg-[#20252a] text-[#7a8591] hover:border-[#3d4752] hover:text-[#a8b0ba]"
+      )}
+    >
+      <Trash2 className="h-3 w-3 shrink-0" />
+      {confirming ? "Click again to confirm" : "Remove"}
+    </button>
+  );
+}
+
+/* ── Provider card ──────────────────────────────── */
+
+function ProviderCard({
+  providerId,
+  currentModel,
+  onPickModel,
+  onRemove,
+}: {
+  providerId: string;
+  currentModel: string | null;
+  onPickModel: () => void;
+  onRemove: () => void;
+}) {
+  const provider = findProvider(providerId);
+  const name = provider?.name ?? providerId;
+  const isActiveProvider = currentModel?.startsWith(providerId + "/") ?? false;
+  const activeModelName =
+    isActiveProvider && currentModel ? getFriendlyModelName(currentModel) : null;
+
+  return (
+    <div className="flex items-center gap-4 rounded-xl border border-[#2c343d] bg-[#15191d] p-4">
+      <ProviderAvatar name={name} />
+      <div className="min-w-0 flex-1">
+        <div className="flex items-center gap-2">
+          <StatusDot active />
+          <span className="text-sm font-semibold text-[#f5f7fa]">{name}</span>
+        </div>
+        {activeModelName ? (
+          <p className="mt-0.5 truncate text-xs text-[#34d399]">Active: {activeModelName}</p>
+        ) : (
+          <p className="mt-0.5 text-xs text-[#7a8591]">No model selected from this provider</p>
+        )}
+      </div>
+      <div className="flex shrink-0 items-center gap-2">
+        <button
+          type="button"
+          onClick={onPickModel}
+          className="flex items-center gap-1.5 rounded-lg border border-[#2c343d] bg-[#20252a] px-2.5 py-1.5 text-xs font-medium text-[#a8b0ba] transition-all hover:border-[#34d399]/30 hover:text-[#34d399]"
+        >
+          <Zap className="h-3 w-3 shrink-0" />
+          Pick model
+        </button>
+        <RemoveButton onRemove={onRemove} />
+      </div>
+    </div>
+  );
+}
+
+/* ── Active model banner ─────────────────────────── */
+
+function ActiveModelBanner({
+  model,
+  onAddProvider,
+}: {
+  model: string | null;
+  onAddProvider: () => void;
+}) {
+  if (model) {
+    const friendlyName = getFriendlyModelName(model);
+    return (
+      <div className="flex items-center gap-4 rounded-xl border border-[#34d399]/20 bg-[#34d399]/5 p-4">
+        <div className="relative flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-[#34d399]/10">
+          <StatusDot active />
+        </div>
+        <div className="min-w-0 flex-1">
+          <p className="text-[11px] font-medium uppercase tracking-wider text-[#34d399]">
+            Active model
+          </p>
+          <p className="mt-0.5 truncate text-sm font-semibold text-[#f5f7fa]">{friendlyName}</p>
+          <p className="mt-0.5 truncate font-mono text-[11px] text-[#7a8591]">{model}</p>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex items-center gap-4 rounded-xl border border-amber-500/20 bg-amber-500/5 p-4">
+      <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-full bg-amber-500/10">
+        <AlertTriangle className="h-5 w-5 text-amber-400" />
+      </div>
+      <div className="min-w-0 flex-1">
+        <p className="text-sm font-semibold text-[#f5f7fa]">No model configured</p>
+        <p className="mt-0.5 text-xs text-[#7a8591]">
+          Connect an AI provider and pick a model to get started.
+        </p>
+      </div>
+      <button
+        type="button"
+        onClick={onAddProvider}
+        className="flex shrink-0 items-center gap-1.5 rounded-lg bg-[#34d399] px-3 py-1.5 text-xs font-semibold text-[#0d1117] transition-all hover:bg-[#2dbe8c]"
+      >
+        <Plus className="h-3 w-3 shrink-0" />
+        Add provider
+      </button>
+    </div>
+  );
+}
+
+/* ── Toast ──────────────────────────────────────── */
+
+function Toast({ message, onClose }: { message: string; onClose: () => void }) {
+  return (
+    <div className="animate-modal-in fixed bottom-6 left-1/2 z-[60] flex -translate-x-1/2 items-center gap-3 rounded-xl border border-red-500/20 bg-[#1d2227] px-4 py-3 shadow-2xl">
+      <AlertCircle className="h-4 w-4 shrink-0 text-red-400" />
+      <span className="whitespace-nowrap text-sm text-[#f5f7fa]">{message}</span>
+      <button
+        type="button"
+        onClick={onClose}
+        className="ml-1 flex h-5 w-5 shrink-0 items-center justify-center rounded text-[#7a8591] hover:text-[#f5f7fa]"
+      >
+        <X className="h-3.5 w-3.5" />
+      </button>
+    </div>
+  );
+}
+
+/* ── Main view ──────────────────────────────────── */
+
+export function ModelsView() {
+  const [summary, setSummary] = useState<SummaryResponse | null>(null);
+  const [showWizard, setShowWizard] = useState(false);
+  const [pickerProvider, setPickerProvider] = useState<Provider | null>(null);
+  const [toastMessage, setToastMessage] = useState<string | null>(null);
+
+  const fetchSummary = useCallback(async () => {
+    try {
+      const res = await fetch("/api/models/summary", {
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) return;
+      const data: SummaryResponse = await res.json();
+      setSummary(data);
+    } catch {
+      // Silently ignore — next poll will retry
+    }
+  }, []);
+
+  useSmartPoll(fetchSummary, { intervalMs: 30000 });
+
+  function showToast(msg: string) {
+    setToastMessage(msg);
+    setTimeout(() => setToastMessage(null), 4000);
+  }
+
+  async function handleRemoveProvider(providerId: string) {
+    try {
+      const res = await fetch("/api/models", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "remove-provider", provider: providerId }),
+        signal: AbortSignal.timeout(10000),
+      });
+      if (!res.ok) throw new Error("Failed");
+      await fetchSummary();
+    } catch {
+      showToast("Could not remove provider. Try again.");
+    }
+  }
+
+  function handlePickerClose() {
+    setPickerProvider(null);
+    void fetchSummary();
+  }
+
+  function handleWizardDone() {
+    void fetchSummary();
+  }
+
+  const configuredProviders = summary?.configuredProviders ?? [];
+  const primaryModel = summary?.defaults?.primary ?? null;
+  const unconnectedProviders = PROVIDERS.filter((p) => !configuredProviders.includes(p.id));
+
+  return (
+    <>
+      <SectionLayout>
+        <SectionHeader
+          title="AI Model"
+          description="Connect your AI provider and choose which model powers your assistant."
+          bordered
+          actions={
+            configuredProviders.length > 0 ? (
+              <button
+                type="button"
+                onClick={() => setShowWizard(true)}
+                className="flex items-center gap-1.5 rounded-lg bg-[#34d399] px-3 py-2 text-sm font-semibold text-[#0d1117] transition-all hover:bg-[#2dbe8c]"
+              >
+                <Plus className="h-4 w-4 shrink-0" />
+                Add provider
+              </button>
+            ) : null
+          }
+        />
+
+        <SectionBody width="content" padding="regular">
+          <div className="space-y-6">
+            {/* Active model banner */}
+            <ActiveModelBanner model={primaryModel} onAddProvider={() => setShowWizard(true)} />
+
+            {/* Connected providers */}
+            {configuredProviders.length > 0 && (
+              <div className="space-y-3">
+                <div className="flex items-center justify-between">
+                  <h2 className="text-xs font-semibold uppercase tracking-wider text-[#7a8591]">
+                    Connected providers
+                  </h2>
+                  <span className="rounded-full border border-[#2c343d] bg-[#20252a] px-2 py-0.5 text-[11px] font-medium text-[#7a8591]">
+                    {configuredProviders.length}
+                  </span>
+                </div>
+                <div className="space-y-3">
+                  {configuredProviders.map((pid) => (
+                    <ProviderCard
+                      key={pid}
+                      providerId={pid}
+                      currentModel={primaryModel}
+                      onPickModel={() => {
+                        const p = findProvider(pid) ?? {
+                          id: pid,
+                          name: pid,
+                          hint: "",
+                          keyPrefix: "",
+                          url: "",
+                        };
+                        setPickerProvider(p);
+                      }}
+                      onRemove={() => void handleRemoveProvider(pid)}
+                    />
+                  ))}
+                </div>
               </div>
             )}
 
-            {/* Change Model button */}
-            <div className="mt-4">
-              <button
-                type="button"
-                onClick={() => setPickerTarget({ kind: "default" })}
-                disabled={Boolean(busyKey)}
-                className="inline-flex items-center gap-1.5 rounded-lg border border-stone-200 bg-stone-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-stone-700 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40 dark:border-[#2c343d] dark:bg-[#171a1d] dark:text-[#c7d0d9] dark:hover:bg-[#1e2227]"
-              >
-                <RefreshCw className="h-3.5 w-3.5" />
-                Change Model
-              </button>
-              <p className="mt-2 text-xs text-muted-foreground/70">
-                Choose the model family you want first, then pick the provider route underneath it.
-              </p>
-            </div>
-
-            {/* Fallback chain */}
-            <div className="mt-4 rounded-lg border border-border/50 bg-muted/20 p-3">
-              <p className="text-xs font-medium text-muted-foreground mb-2">
-                Fallback Chain {defaultFallbacks.length > 0 && `(${defaultFallbacks.length})`}
-              </p>
-              {defaultFallbacks.length === 0 ? (
-                <p className="text-xs text-muted-foreground/60">
-                  No fallback models configured. If the primary model fails, requests will error.
-                </p>
-              ) : (
-                <div className="space-y-1.5">
-                  {defaultFallbacks.map((fallback, i) => {
-                    const fbMeta = getModelMeta(fallback);
-                    return (
-                      <div
-                        key={`fallback:${fallback}`}
-                        className="flex items-center justify-between gap-2 rounded-md border border-border/40 bg-card/60 px-3 py-1.5"
-                      >
-                        <div className="flex items-center gap-2 min-w-0">
-                          <span className="text-xs font-medium text-muted-foreground/50 w-4 shrink-0">
-                            {i + 1}.
-                          </span>
-                          <span className="text-xs font-medium text-foreground truncate">
-                            {getFriendlyModelName(fallback)}
-                          </span>
-                          {fbMeta && (
-                            <span className="text-xs text-muted-foreground/50 hidden sm:inline">
-                              {getProviderDisplayName(fbMeta.provider)}
-                            </span>
-                          )}
-                        </div>
-                        <button
-                          type="button"
-                          onClick={() => void removeDefaultFallback(fallback)}
-                          disabled={Boolean(busyKey)}
-                          className="shrink-0 rounded p-1 text-muted-foreground/50 transition-colors hover:bg-muted/60 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          <X className="h-3 w-3" />
-                        </button>
-                      </div>
-                    );
-                  })}
-                </div>
-              )}
-              <button
-                type="button"
-                onClick={() => setPickerTarget({ kind: "default-fallback" })}
-                disabled={Boolean(busyKey)}
-                className="mt-2 inline-flex items-center gap-1 rounded-md border border-border/50 bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-              >
-                <Plus className="h-3 w-3" />
-                Add Fallback
-              </button>
-            </div>
-          </div>
-        </section>
-
-        {/* ━━━ SECTION 2: Providers & Keys ━━━ */}
-        <section ref={providerAccessRef} className="rounded-2xl border border-border p-5 bg-card">
-          <div className="flex items-center justify-between gap-2 mb-4">
-            <div className="flex items-center gap-2">
-              <Shield className="h-4 w-4 text-[var(--accent-brand-text)]" />
-              <h2 className="text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                Providers & Keys
-              </h2>
-              <StatusPill
-                tone={connectedProviderCount > 0 ? "good" : "warn"}
-                label={`${connectedProviderCount}/${providerAuthSummary.length}`}
-              />
-            </div>
-          </div>
-          <div className="mb-4 rounded-xl border border-border/70 bg-muted/20 p-3">
-            <p className="text-sm font-medium text-foreground">
-              The same model can come from different providers.
-            </p>
-            <p className="mt-1 text-xs text-muted-foreground">
-              For example, Claude can run directly from Anthropic or through OpenRouter. The model picker shows those routes side by side, and this section controls which routes are ready to use.
-            </p>
-          </div>
-
-          {/* Provider chips */}
-          {providerAuthSummary.length === 0 && connectableProviders.length === 0 ? (
-            <div className="rounded-xl border border-amber-500/20 bg-amber-500/5 p-4 text-center">
-              <p className="text-sm text-foreground font-medium">No providers detected</p>
-              <p className="mt-1 text-xs text-muted-foreground">
-                Connect an AI provider to start using models.
-              </p>
-            </div>
-          ) : (
-            <>
-              <div className="flex flex-wrap gap-2">
-                {providerAuthSummary.map((provider) => (
+            {/* Loading skeleton */}
+            {summary === null && (
+              <div className="space-y-3">
+                {[0, 1].map((i) => (
                   <div
-                    key={`provider:${provider.provider}`}
-                    className={cn(
-                      "rounded-lg border px-3 py-2 text-xs transition-colors",
-                      provider.connected
-                        ? "border-emerald-500/20 bg-emerald-500/5"
-                        : "border-border bg-muted/20",
-                    )}
-                  >
-                    <div className="flex items-center gap-2">
-                      {provider.connected ? (
-                        <Check className="h-3 w-3 text-emerald-400" />
-                      ) : (
-                        <X className="h-3 w-3 text-muted-foreground/50" />
-                      )}
-                      <span className="font-medium text-foreground">
-                        {getProviderDisplayName(provider.provider)}
-                      </span>
-                    </div>
-                    {provider.connected && provider.authKind && (
-                      <p className="mt-0.5 pl-5 text-muted-foreground/60">
-                        via {provider.authKind}
-                      </p>
-                    )}
-                    {(() => {
-                      const count = providerCatalogCounts.get(provider.provider);
-                      if (!count) return null;
-                      const label =
-                        count.local > 0
-                          ? `${count.total} model${count.total === 1 ? "" : "s"} discovered (${count.local} local)`
-                          : `${count.total} model${count.total === 1 ? "" : "s"} discovered`;
-                      return <p className="mt-0.5 pl-5 text-muted-foreground/60">{label}</p>;
-                    })()}
-                    {provider.provider === "ollama" && (
-                      <p className="mt-0.5 pl-5 text-muted-foreground/60">
-                        Ollama shows models installed on this machine only.
-                      </p>
-                    )}
-                  </div>
+                    key={i}
+                    className="h-20 animate-pulse rounded-xl border border-[#2c343d] bg-[#15191d]"
+                  />
                 ))}
               </div>
-              {providerAuthSummary.length === 1 && providerAuthSummary[0]?.provider === "ollama" && (
-                <div className="mt-3 rounded-lg border border-border/60 bg-muted/20 p-3">
-                  <p className="text-xs font-medium text-foreground">Only one Ollama model found</p>
-                  <p className="mt-1 text-xs text-muted-foreground">
-                    Pull another model to expand your local catalog, for example{" "}
-                    <code className="font-mono">ollama pull llama3.1:8b</code>.
+            )}
+
+            {/* Empty state */}
+            {summary !== null && configuredProviders.length === 0 && (
+              <div className="flex flex-col items-center gap-4 rounded-xl border border-dashed border-[#2c343d] py-16 text-center">
+                <div className="flex h-14 w-14 items-center justify-center rounded-2xl border border-[#2c343d] bg-[#15191d]">
+                  <Key className="h-6 w-6 text-[#3d4752]" />
+                </div>
+                <div>
+                  <p className="text-sm font-semibold text-[#f5f7fa]">No providers connected yet</p>
+                  <p className="mt-1 max-w-xs text-xs leading-relaxed text-[#7a8591]">
+                    Add an AI provider API key to get started. Your key is stored securely on this
+                    device.
                   </p>
                 </div>
-              )}
-            </>
-          )}
-
-          {/* ── Connect a new provider ── */}
-          {connectableProviders.length > 0 && (
-            <div className="mt-4">
-              <div className="mb-2 text-xs font-bold uppercase tracking-wider text-muted-foreground/40">
-                Add another provider
-              </div>
-              <div className="grid grid-cols-2 gap-1.5 sm:grid-cols-3">
-                {connectableProviders.slice(0, 12).map((p) => {
-                  const meta = CONNECT_PROVIDER_META[p];
-                  const isActive = connectProvider === p;
-                  return (
-                    <button
-                      key={p}
-                      type="button"
-                      onClick={() => {
-                        if (isActive) {
-                          setConnectProvider(null);
-                          setConnectKey("");
-                          setConnectBaseUrl("");
-                          setConnectShowKey(false);
-                          setConnectPhase("key");
-                          setConnectValidatedKey("");
-                          setConnectModels([]);
-                          setConnectSelectedModel("");
-                          setConnectSelectedAgent("");
-                        } else {
-                          setConnectProvider(p);
-                          setConnectKey("");
-                          setConnectBaseUrl("");
-                          setConnectShowKey(false);
-                          setConnectPhase("key");
-                          setConnectValidatedKey("");
-                          setConnectModels([]);
-                          setConnectSelectedModel("");
-                          setConnectSelectedAgent("");
-                        }
-                      }}
-                      className={cn(
-                        "flex items-center gap-1.5 rounded-lg border px-2.5 py-2 text-xs transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                        isActive
-                          ? "border-[var(--accent-brand-border)] bg-[var(--accent-brand-subtle)] text-foreground"
-                          : connectSuccess === p
-                            ? "border-emerald-500/25 bg-emerald-500/10 text-emerald-700 dark:text-emerald-300"
-                            : "border-foreground/10 bg-foreground/5 text-muted-foreground/70 hover:border-[var(--accent-brand-border)] hover:text-foreground/80",
-                      )}
-                    >
-                      <span>{meta?.icon || "🤖"}</span>
-                      <span className="truncate font-medium">{meta?.label || getProviderDisplayName(p)}</span>
-                      {connectSuccess === p ? (
-                        <Check className="ml-auto h-3 w-3 text-emerald-400" />
-                      ) : (
-                        <Plus className="ml-auto h-2.5 w-2.5 text-muted-foreground/30" />
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {/* ── Inline connect flow (two-phase) ── */}
-          {connectProvider && (() => {
-            const meta = CONNECT_PROVIDER_META[connectProvider];
-            const isCustom = connectProvider === "custom";
-            const canValidate = isCustom
-              ? connectBaseUrl.trim().length > 0
-              : connectKey.trim().length > 0;
-            const closeConnect = () => {
-              setConnectProvider(null);
-              setConnectKey("");
-              setConnectBaseUrl("");
-              setConnectShowKey(false);
-              setConnectPhase("key");
-              setConnectValidatedKey("");
-              setConnectModels([]);
-              setConnectSelectedModel("");
-              setConnectSelectedAgent("");
-            };
-            return (
-            <div className="mt-3 rounded-xl border border-[var(--accent-brand-border)] bg-[var(--accent-brand-subtle)] p-4">
-              <div className="flex items-center gap-2 mb-3">
-                <span className="text-sm">{meta?.icon || "🤖"}</span>
-                <span className="text-xs font-semibold text-foreground">
-                  Connect {meta?.label || connectProvider}
-                </span>
-                {connectPhase === "configure" && (
-                  <span className="rounded-full bg-emerald-500/15 px-1.5 py-0.5 text-[10px] font-medium text-emerald-600 dark:text-emerald-400">
-                    Key verified
-                  </span>
-                )}
                 <button
                   type="button"
-                  onClick={closeConnect}
-                  className="ml-auto rounded p-0.5 text-muted-foreground/40 hover:text-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  onClick={() => setShowWizard(true)}
+                  className="flex items-center gap-2 rounded-lg bg-[#34d399] px-4 py-2.5 text-sm font-semibold text-[#0d1117] transition-all hover:bg-[#2dbe8c]"
                 >
-                  <X className="h-3.5 w-3.5" />
+                  <Plus className="h-4 w-4 shrink-0" />
+                  Add your first provider
                 </button>
               </div>
+            )}
 
-              {/* ── Phase 1: Key input ── */}
-              {connectPhase === "key" && (
-                <>
-                  {/* Base URL input for custom providers */}
-                  {meta?.needsBaseUrl && (
-                    <div className="mb-2">
-                      <label className="mb-1 block text-[11px] font-medium text-muted-foreground/60">
-                        Endpoint URL
-                      </label>
-                      <input
-                        type="text"
-                        value={connectBaseUrl}
-                        onChange={(e) => setConnectBaseUrl(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter" && canValidate) { e.preventDefault(); handleValidateKey(); } }}
-                        placeholder={meta.baseUrlPlaceholder || "https://api.example.com/v1"}
-                        aria-label="Endpoint URL"
-                        className="w-full rounded-lg border border-border bg-card px-3 py-2.5 text-xs font-mono text-foreground/90 placeholder:text-muted-foreground/50 focus:border-[var(--accent-brand-border)] focus:outline-none focus:ring-1 focus:ring-[var(--accent-brand-ring)]"
-                        autoFocus
-                      />
-                      <p className="mt-1 text-[10px] text-muted-foreground/40">
-                        Any OpenAI-compatible endpoint (vLLM, Ollama, LM Studio, NVIDIA NIM, etc.)
-                      </p>
-                    </div>
-                  )}
-                  <div className="flex gap-2">
-                    <div className="relative flex-1">
-                      {meta?.needsBaseUrl && (
-                        <label className="mb-1 block text-[11px] font-medium text-muted-foreground/60">
-                          API Key {meta?.keyOptional ? "(optional)" : ""}
-                        </label>
-                      )}
-                      <input
-                        type={connectShowKey ? "text" : "password"}
-                        value={connectKey}
-                        onChange={(e) => setConnectKey(e.target.value)}
-                        onKeyDown={(e) => { if (e.key === "Enter" && canValidate) { e.preventDefault(); handleValidateKey(); } }}
-                        placeholder={meta?.keyHint || "Paste API key..."}
-                        aria-label={`API Key${meta?.keyOptional ? " (optional)" : ""}`}
-                        className="w-full rounded-lg border border-border bg-card px-3 py-2.5 pr-9 text-xs font-mono text-foreground/90 placeholder:text-muted-foreground/50 focus:border-[var(--accent-brand-border)] focus:outline-none focus:ring-1 focus:ring-[var(--accent-brand-ring)]"
-                        autoFocus={!meta?.needsBaseUrl}
-                      />
-                      <button
-                        type="button"
-                        onClick={() => setConnectShowKey(!connectShowKey)}
-                        className="absolute right-2.5 bottom-2.5 text-muted-foreground/40 hover:text-foreground/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        {connectShowKey ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-                      </button>
-                    </div>
+            {/* Available (not yet connected) providers grid */}
+            {configuredProviders.length > 0 && unconnectedProviders.length > 0 && (
+              <div className="space-y-3">
+                <h2 className="text-xs font-semibold uppercase tracking-wider text-[#7a8591]">
+                  Available providers
+                </h2>
+                <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4">
+                  {unconnectedProviders.map((p) => (
                     <button
+                      key={p.id}
                       type="button"
-                      onClick={handleValidateKey}
-                      disabled={!canValidate || connectSaving}
-                      className={cn(
-                        "shrink-0 rounded-lg bg-[var(--accent-brand)] text-[var(--accent-brand-on)] px-4 py-2.5 text-xs font-medium transition-colors hover:opacity-90 disabled:opacity-40",
-                        meta?.needsBaseUrl && "self-end",
-                      )}
+                      onClick={() => setShowWizard(true)}
+                      className="group flex flex-col items-start gap-2 rounded-xl border border-[#2c343d] bg-[#15191d] p-3 text-left transition-all hover:border-[#3d4752] hover:bg-[#1d2227]"
                     >
-                      {connectSaving ? <BusyDots /> : "Validate & Continue"}
-                    </button>
-                  </div>
-                  <div className="mt-2 flex items-center gap-1.5 text-xs text-muted-foreground/50">
-                    <KeyRound className="h-2.5 w-2.5" />
-                    <span>Stored securely in OpenClaw. Never leaves your machine.</span>
-                    {meta?.keyUrl && (
-                      <a
-                        href={meta.keyUrl}
-                        target="_blank"
-                        rel="noopener noreferrer"
-                        className="ml-auto flex items-center gap-0.5 text-[var(--accent-brand-text)] hover:text-[var(--accent-brand)]"
-                      >
-                        Get a key <ExternalLink className="h-2.5 w-2.5" />
-                      </a>
-                    )}
-                  </div>
-                </>
-              )}
-
-              {/* ── Phase 2: Model + Agent selection ── */}
-              {connectPhase === "configure" && (
-                <>
-                  <div className="space-y-3">
-                    {/* Model dropdown */}
-                    <div>
-                      <label className="mb-1 block text-[11px] font-medium text-muted-foreground/60">
-                        Model
-                      </label>
-                      {connectModelsLoading ? (
-                        <div className="flex items-center gap-2 rounded-lg border border-border bg-card px-3 py-2.5 text-xs text-muted-foreground">
-                          <Loader2 className="h-3 w-3 animate-spin" />
-                          Loading available models…
-                        </div>
-                      ) : connectModels.length > 0 ? (
-                        <select
-                          value={connectSelectedModel}
-                          onChange={(e) => setConnectSelectedModel(e.target.value)}
-                          className="w-full rounded-lg border border-border bg-card px-3 py-2.5 text-xs text-foreground/90 focus:border-[var(--accent-brand-border)] focus:outline-none focus:ring-1 focus:ring-[var(--accent-brand-ring)]"
-                        >
-                          {connectModels.map((m) => (
-                            <option key={m.id} value={m.id}>
-                              {m.name || m.id}
-                            </option>
-                          ))}
-                        </select>
-                      ) : (
-                        <div className="rounded-lg border border-border bg-card px-3 py-2.5 text-xs text-muted-foreground/60">
-                          Could not load models — the key will still be saved
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Agent dropdown */}
-                    {connectModels.length > 0 && (
+                      <div className="flex h-8 w-8 items-center justify-center rounded-lg border border-[#2c343d] bg-[#20252a] text-xs font-bold text-[#a8b0ba]">
+                        {p.name.charAt(0)}
+                      </div>
                       <div>
-                        <label className="mb-1 block text-[11px] font-medium text-muted-foreground/60">
-                          Assign to
-                        </label>
-                        <select
-                          value={connectSelectedAgent}
-                          onChange={(e) => setConnectSelectedAgent(e.target.value)}
-                          className="w-full rounded-lg border border-border bg-card px-3 py-2.5 text-xs text-foreground/90 focus:border-[var(--accent-brand-border)] focus:outline-none focus:ring-1 focus:ring-[var(--accent-brand-ring)]"
-                        >
-                          <option value="">All agents (default)</option>
-                          {agents.map((a) => (
-                            <option key={a.id} value={a.id}>
-                              {a.name}
-                            </option>
-                          ))}
-                        </select>
+                        <p className="text-xs font-semibold text-[#d6dce3]">{p.name}</p>
+                        <p className="text-[10px] text-[#7a8591]">{p.hint}</p>
                       </div>
-                    )}
-                  </div>
-
-                  {/* Actions */}
-                  <div className="mt-3 flex items-center gap-2">
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setConnectPhase("key");
-                        setConnectModels([]);
-                        setConnectSelectedModel("");
-                        setConnectSelectedAgent("");
-                        setConnectValidatedKey("");
-                      }}
-                      className="flex items-center gap-1 text-xs text-muted-foreground/60 hover:text-foreground/80 transition-colors"
-                    >
-                      <ChevronLeft className="h-3 w-3" />
-                      Change key
                     </button>
-                    <button
-                      type="button"
-                      onClick={handleConnectSave}
-                      disabled={connectSaving}
-                      className="ml-auto shrink-0 rounded-lg bg-[var(--accent-brand)] text-[var(--accent-brand-on)] px-4 py-2.5 text-xs font-medium transition-colors hover:opacity-90 disabled:opacity-40"
-                    >
-                      {connectSaving ? <BusyDots /> : "Connect"}
-                    </button>
-                  </div>
-                </>
-              )}
-            </div>
-            );
-          })()}
-
-          {/* Manage keys link */}
-          {hasCredentialProviders && (
-            <div className="mt-3">
-              <div className="rounded-lg border border-border/60 bg-muted/20 p-3">
-                <p className="text-xs font-medium text-foreground">
-                  Need more detail about saved keys or logins?
-                </p>
-                <p className="mt-1 text-xs text-muted-foreground">
-                  Open Keys & Access to inspect saved API keys, auth profiles, env sources, and channel logins. Model choice and provider setup stay here in Models.
-                </p>
-                <a
-                  href="/accounts"
-                  className="mt-2 inline-flex items-center gap-1.5 rounded-lg border border-border bg-card px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50"
-                >
-                  <KeyRound className="h-3.5 w-3.5" />
-                  Open Keys & Access
-                  <ExternalLink className="h-3 w-3" />
-                </a>
+                  ))}
+                </div>
               </div>
-            </div>
-          )}
-        </section>
+            )}
+          </div>
+        </SectionBody>
+      </SectionLayout>
 
-        {/* ━━━ SECTION 3: Advanced Settings ━━━ */}
-        <section className="rounded-2xl border border-border overflow-hidden bg-card">
-          <button
-            type="button"
-            onClick={() => setAdvancedOpen(!advancedOpen)}
-            className="flex w-full items-center justify-between px-5 py-3.5 transition-colors hover:bg-foreground/5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-          >
-            <div className="flex items-center gap-2">
-              <h2 className="text-xs font-semibold text-foreground">Advanced Settings</h2>
-              {mainHasOverride && <StatusPill tone="warn" label="Overrides active" />}
-            </div>
-            <ChevronDown
-              className={cn(
-                "h-4 w-4 shrink-0 text-muted-foreground transition-transform",
-                advancedOpen && "rotate-180",
-              )}
-            />
-          </button>
-
-          {advancedOpen && (
-            <div className="border-t border-border">
-              {/* Tab bar */}
-              <div className="flex border-b border-border">
-                {(
-                  [
-                    { key: "agents" as const, label: "Per-Agent", icon: Bot },
-                    { key: "allowlist" as const, label: "Allowlist", icon: Shield },
-                    { key: "routing" as const, label: "Routing", icon: SlidersHorizontal },
-                    { key: "aliases" as const, label: "Aliases & Auth", icon: Tag },
-                  ] as const
-                ).map((tab) => (
-                  <button
-                    key={tab.key}
-                    type="button"
-                    onClick={() => setAdvancedTab(tab.key)}
-                    className={cn(
-                      "flex items-center gap-1.5 px-4 py-2.5 text-xs font-medium transition-colors border-b-2 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                      advancedTab === tab.key
-                        ? "border-[var(--accent-brand)] text-[var(--accent-brand-text)]"
-                        : "border-transparent text-muted-foreground hover:text-foreground hover:bg-foreground/5",
-                    )}
-                  >
-                    <tab.icon className="h-3.5 w-3.5" />
-                    {tab.label}
-                  </button>
-                ))}
-              </div>
-
-              <div className="px-5 py-4">
-                {/* ── Tab 1: Per-Agent Overrides ── */}
-                {advancedTab === "agents" && (
-                  <div>
-                    <p className="text-xs text-muted-foreground mb-4">
-                      Override the model for individual agents. Agents without overrides inherit
-                      the global default model.
-                    </p>
-                    <div className="space-y-3">
-                      {sortedAgents.map((agent) => {
-                        const configured = agent.modelPrimary || defaultPrimary;
-                        const runtime = agentStatuses[agent.id];
-                        const resolved =
-                          runtime?.resolvedDefault || runtime?.defaultModel || configured;
-                        const configuredFallbacks = Array.isArray(agent.modelFallbacks)
-                          ? agent.modelFallbacks
-                          : [];
-                        const rowBusy =
-                          busyKey === `agent:${agent.id}` ||
-                          busyKey === `reset:${agent.id}` ||
-                          busyKey === `agent:fallback:${agent.id}`;
-
-                        return (
-                          <div
-                            key={agent.id}
-                            className="rounded-xl border border-border/70 bg-muted/10 p-3"
-                          >
-                            <div className="flex flex-wrap items-center justify-between gap-2">
-                              <div className="flex items-center gap-2">
-                                <span className="text-xs font-semibold text-foreground">
-                                  {agent.name}
-                                </span>
-                                <StatusPill
-                                  tone={agent.usesDefaults ? "neutral" : "warn"}
-                                  label={
-                                    agent.usesDefaults ? "uses default" : "override"
-                                  }
-                                />
-                              </div>
-                              <div className="flex items-center gap-2">
-                                {!agent.usesDefaults && (
-                                  <button
-                                    type="button"
-                                    onClick={() => void resetAgentToDefaults(agent)}
-                                    disabled={Boolean(busyKey)}
-                                    className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                  >
-                                    <RotateCcw className="h-3 w-3" />
-                                    Reset
-                                  </button>
-                                )}
-                                {rowBusy && (
-                                  <span className="text-xs text-[var(--accent-brand-text)]">
-                                    <BusyDots />
-                                  </span>
-                                )}
-                              </div>
-                            </div>
-
-                            {/* Current effective model */}
-                            <div className="mt-2 flex items-center gap-2">
-                              <span className="text-xs text-muted-foreground">Model:</span>
-                              <span className="text-xs font-medium text-foreground">
-                                {getFriendlyModelName(resolved)}
-                              </span>
-                              <button
-                                type="button"
-                                onClick={() =>
-                                  setPickerTarget({ kind: "agent", agent })
-                                }
-                                disabled={Boolean(busyKey)}
-                                className="inline-flex items-center gap-1 rounded-md border border-border/50 bg-card px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                              >
-                                <RefreshCw className="h-3 w-3" />
-                                Change
-                              </button>
-                            </div>
-
-                            {/* Agent fallbacks */}
-                            {(configuredFallbacks.length > 0 || !agent.usesDefaults) && (
-                              <div className="mt-2 flex flex-wrap items-center gap-1.5">
-                                <span className="text-xs text-muted-foreground">Fallbacks:</span>
-                                {configuredFallbacks.map((fb) => (
-                                  <span
-                                    key={`${agent.id}:fb:${fb}`}
-                                    className="inline-flex items-center gap-1 rounded-md border border-border/40 bg-muted/30 px-2 py-0.5 text-xs text-muted-foreground"
-                                  >
-                                    {getFriendlyModelName(fb)}
-                                    <button
-                                      type="button"
-                                      onClick={() => void removeAgentFallback(agent, fb)}
-                                      disabled={Boolean(busyKey)}
-                                      className="rounded p-0.5 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                    >
-                                      <X className="h-2.5 w-2.5" />
-                                    </button>
-                                  </span>
-                                ))}
-                                <button
-                                  type="button"
-                                  onClick={() =>
-                                    setPickerTarget({
-                                      kind: "agent-fallback",
-                                      agent,
-                                    })
-                                  }
-                                  disabled={Boolean(busyKey)}
-                                  className="inline-flex items-center gap-0.5 rounded-md border border-dashed border-border/50 px-2 py-0.5 text-xs text-muted-foreground/60 transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                >
-                                  <Plus className="h-3 w-3" />
-                                  Add
-                                </button>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
-                )}
-
-                {/* ── Tab 2: Allowlist ── */}
-                {advancedTab === "allowlist" && (
-                  <div>
-                    <p className="text-xs text-muted-foreground mb-3">
-                      Control which models are available for selection.
-                      {allModels.length > 0 && (
-                        <span className="ml-1 text-muted-foreground/50">
-                          ({allModels.length} models discovered from providers)
-                        </span>
-                      )}
-                    </p>
-
-                    {allModelsWarning && (
-                      <p className="mb-3 text-xs text-amber-400">
-                        <AlertTriangle className="mr-1 inline h-3 w-3" />
-                        {allModelsWarning}
-                      </p>
-                    )}
-
-                    {/* Current allowlist */}
-                    <div className="rounded-lg border border-border/50 bg-muted/10 p-3 mb-3">
-                      <div className="flex items-center justify-between gap-2 mb-2">
-                        <p className="text-xs font-medium text-foreground">
-                          Allowed Models ({configuredAllowed.length})
-                        </p>
-                        <div className="flex gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => void fetchAllModels(true)}
-                            disabled={allModelsLoading || Boolean(busyKey)}
-                            className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                          >
-                            {allModelsLoading ? <BusyDots /> : <RefreshCw className="h-3 w-3" />}
-                            Refresh
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void scanModels()}
-                            disabled={Boolean(busyKey)}
-                            className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                          >
-                            {busyKey === "catalog:scan" ? (
-                              <BusyDots />
-                            ) : (
-                              <Search className="h-3 w-3" />
-                            )}
-                            Scan
-                          </button>
-                        </div>
-                      </div>
-                      {configuredAllowed.length === 0 ? (
-                        <p className="text-xs text-muted-foreground/60">
-                          No explicit allowlist. All discovered models are available.
-                        </p>
-                      ) : (
-                        <div className="flex flex-wrap gap-1.5">
-                          {configuredAllowed.map((entry) => (
-                            <button
-                              key={`allow:${entry}`}
-                              type="button"
-                              onClick={() => void removeAllowedModel(entry)}
-                              disabled={Boolean(busyKey)}
-                              className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-                            >
-                              {getFriendlyModelName(entry)}
-                              <Trash2 className="h-3 w-3" />
-                            </button>
-                          ))}
-                        </div>
-                      )}
-                    </div>
-
-                    {/* Add to allowlist */}
-                    <div className="flex flex-wrap items-center gap-2">
-                      <button
-                        type="button"
-                        onClick={() => setPickerTarget({ kind: "allowlist" })}
-                        disabled={Boolean(busyKey)}
-                        className="inline-flex items-center gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                      >
-                        <Plus className="h-3.5 w-3.5" />
-                        Add from Catalog
-                      </button>
-                      <div className="flex items-center gap-1.5">
-                        <input
-                          type="text"
-                          value={customModelToAdd}
-                          onChange={(e) => setCustomModelToAdd(e.target.value)}
-                          placeholder="provider/model-name"
-                          aria-label="Custom model to add (provider/model-name)"
-                          className="rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)] w-56"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => {
-                            void addAllowedModel(customModelToAdd);
-                            setCustomModelToAdd("");
-                          }}
-                          disabled={!customModelToAdd.trim() || Boolean(busyKey)}
-                          className="inline-flex items-center gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                          Add Custom
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* ── Tab 3: Routing ── */}
-                {advancedTab === "routing" && (
-                  <div className="space-y-4">
-                    <p className="text-xs text-muted-foreground">
-                      Configure failover and catalog behavior. These controls map directly to
-                      OpenClaw model routing settings.
-                    </p>
-                    {detailsLoading && (
-                      <p className="text-xs text-muted-foreground">
-                        <BusyDots /> Loading runtime routing details...
-                      </p>
-                    )}
-
-                    <div className="rounded-lg border border-border/60 bg-muted/10 p-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <h3 className="text-xs font-semibold text-foreground">Image Routing</h3>
-                          <p className="mt-1 text-xs text-muted-foreground/70">
-                            Choose the model used for image-capable requests and define failover.
-                          </p>
-                        </div>
-                        <StatusPill
-                          tone={imageModel ? "good" : "warn"}
-                          label={imageModel ? "configured" : "not configured"}
-                        />
-                      </div>
-
-                      <div className="mt-3 flex flex-wrap items-center gap-2">
-                        <span className="text-xs text-muted-foreground">Primary image model:</span>
-                        <span className="rounded-md border border-border/60 bg-card px-2 py-1 text-xs font-medium text-foreground">
-                          {imageModel ? getFriendlyModelName(imageModel) : "Not set"}
-                        </span>
-                        <button
-                          type="button"
-                          onClick={() => setPickerTarget({ kind: "image-model" })}
-                          disabled={Boolean(busyKey)}
-                          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          <ImageIcon className="h-3.5 w-3.5" />
-                          Choose model
-                        </button>
-                      </div>
-
-                      <div className="mt-3">
-                        <p className="text-xs text-muted-foreground mb-2">
-                          Image fallback chain ({imageFallbacks.length})
-                        </p>
-                        {imageFallbacks.length === 0 ? (
-                          <p className="text-xs text-muted-foreground/60">
-                            No image fallback models configured.
-                          </p>
-                        ) : (
-                          <div className="flex flex-wrap gap-1.5">
-                            {imageFallbacks.map((fallback) => (
-                              <span
-                                key={`image-fallback:${fallback}`}
-                                className="inline-flex items-center gap-1 rounded-md border border-border bg-card px-2 py-1 text-xs text-muted-foreground"
-                              >
-                                {getFriendlyModelName(fallback)}
-                                <button
-                                  type="button"
-                                  onClick={() => void removeImageFallback(fallback)}
-                                  disabled={Boolean(busyKey)}
-                                  className="rounded p-0.5 transition-colors hover:bg-muted/60 hover:text-red-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                >
-                                  <X className="h-2.5 w-2.5" />
-                                </button>
-                              </span>
-                            ))}
-                          </div>
-                        )}
-                        <button
-                          type="button"
-                          onClick={() => setPickerTarget({ kind: "image-fallback" })}
-                          disabled={Boolean(busyKey)}
-                          className="mt-2 inline-flex items-center gap-1 rounded-md border border-dashed border-border px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                          Add image fallback
-                        </button>
-                      </div>
-                    </div>
-
-                    <div className="rounded-lg border border-border/60 bg-muted/10 p-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <div>
-                          <h3 className="text-xs font-semibold text-foreground">
-                            Heartbeat Model
-                          </h3>
-                          <p className="mt-1 text-xs text-muted-foreground/70">
-                            Select the model used by automated heartbeat jobs.
-                          </p>
-                        </div>
-                        <StatusPill
-                          tone={heartbeatModel ? "warn" : "neutral"}
-                          label={heartbeatModel ? "override" : "inherits default"}
-                        />
-                      </div>
-
-                      <div className="mt-3 grid gap-2 md:grid-cols-[minmax(0,180px)_auto_auto]">
-                        <input
-                          type="text"
-                          value={heartbeatEveryDraft}
-                          onChange={(e) => setHeartbeatEveryDraft(e.target.value)}
-                          placeholder="1h"
-                          aria-label="Heartbeat interval (e.g. 1h)"
-                          className="rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                        />
-                        <button
-                          type="button"
-                          onClick={() => void setHeartbeatEvery(heartbeatEveryDraft)}
-                          disabled={
-                            Boolean(busyKey) ||
-                            !heartbeatEveryDraft.trim() ||
-                            heartbeatEveryDraft.trim() === heartbeatEvery
-                          }
-                          className="inline-flex items-center justify-center gap-1 rounded-md border border-border bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          Save interval
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => setPickerTarget({ kind: "heartbeat-model" })}
-                          disabled={Boolean(busyKey)}
-                          className="inline-flex items-center justify-center gap-1 rounded-md border border-border bg-muted/30 px-3 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          <RefreshCw className="h-3.5 w-3.5" />
-                          Choose model
-                        </button>
-                      </div>
-
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        <span className="text-xs text-muted-foreground">
-                          Effective heartbeat model:
-                        </span>
-                        <span className="rounded-md border border-border/60 bg-card px-2 py-1 text-xs font-medium text-foreground">
-                          {getFriendlyModelName(heartbeatModel || defaultPrimary)}
-                          {!heartbeatModel ? " (default)" : ""}
-                        </span>
-                        {heartbeatModel && (
-                          <button
-                            type="button"
-                            onClick={() => void setHeartbeatModel("")}
-                            disabled={Boolean(busyKey)}
-                            className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                          >
-                            <RotateCcw className="h-3.5 w-3.5" />
-                            Reset model
-                          </button>
-                        )}
-                      </div>
-                    </div>
-
-                    <div className="rounded-lg border border-border/60 bg-muted/10 p-3">
-                      <h3 className="text-xs font-semibold text-foreground">Provider Catalog Mode</h3>
-                      <p className="mt-1 text-xs text-muted-foreground/70">
-                        <code>merge</code> keeps built-in providers and adds overrides.
-                        <code className="ml-1">replace</code> uses only providers listed below.
-                      </p>
-                      <div className="mt-3 inline-flex rounded-lg border border-border bg-muted p-1">
-                        {(["merge", "replace"] as const).map((mode) => (
-                          <button
-                            key={`catalog-mode:${mode}`}
-                            type="button"
-                            onClick={() => void setCatalogMode(mode)}
-                            disabled={Boolean(busyKey)}
-                            className={cn(
-                              "rounded-md px-3 py-1.5 text-xs font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring",
-                              modelsCatalogConfig.mode === mode
-                                ? "bg-card text-foreground shadow-sm"
-                                : "text-muted-foreground hover:text-foreground",
-                            )}
-                          >
-                            {mode}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-
-                    <div className="rounded-lg border border-border/60 bg-muted/10 p-3">
-                      <div className="flex flex-wrap items-center justify-between gap-2">
-                        <h3 className="text-xs font-semibold text-foreground">
-                          Provider Overrides
-                        </h3>
-                        <StatusPill
-                          tone={modelsCatalogConfig.providers.length > 0 ? "warn" : "neutral"}
-                          label={`${modelsCatalogConfig.providers.length} active`}
-                        />
-                      </div>
-
-                      {modelsCatalogConfig.providers.length > 0 ? (
-                        <div className="mt-2 space-y-1.5">
-                          {modelsCatalogConfig.providers.map((entry) => (
-                            <div
-                              key={`provider-override:${entry.provider}`}
-                              className="flex flex-wrap items-center justify-between gap-2 rounded-md border border-border/50 bg-card/70 px-2.5 py-2"
-                            >
-                              <div className="min-w-0">
-                                <p className="text-xs font-medium text-foreground">
-                                  {PROVIDER_INFO[entry.provider]?.displayName ||
-                                    getProviderDisplayName(entry.provider)}
-                                </p>
-                                <p className="text-xs text-muted-foreground/60">
-                                  <code>{entry.provider}</code> ·{" "}
-                                  {Object.keys(entry.config || {}).length} keys
-                                </p>
-                              </div>
-                              <div className="flex items-center gap-1.5">
-                                <button
-                                  type="button"
-                                  onClick={() => {
-                                    setProviderDraftId(entry.provider);
-                                    setProviderDraftCustomId("");
-                                    loadProviderDraft(entry.provider);
-                                  }}
-                                  className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                                >
-                                  Edit
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={() => void removeProviderConfig(entry.provider)}
-                                  disabled={Boolean(busyKey)}
-                                  className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                >
-                                  <Trash2 className="h-3.5 w-3.5" />
-                                  Remove
-                                </button>
-                              </div>
-                            </div>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="mt-2 text-xs text-muted-foreground/60">
-                          No provider overrides configured.
-                        </p>
-                      )}
-
-                      <div className="mt-3 grid gap-2 md:grid-cols-2">
-                        <select
-                          value={providerDraftId}
-                          onChange={(e) => {
-                            const next = e.target.value;
-                            setProviderDraftError(null);
-                            setProviderDraftId(next);
-                            if (next && next !== "__custom__") {
-                              setProviderDraftCustomId("");
-                              loadProviderDraft(next);
-                            }
-                          }}
-                          aria-label="Select provider to configure"
-                          className="rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                        >
-                          <option value="">Select provider...</option>
-                          {providerDraftOptions.map((provider) => (
-                            <option key={`provider-draft:${provider}`} value={provider}>
-                              {PROVIDER_INFO[provider]?.displayName ||
-                                getProviderDisplayName(provider)}{" "}
-                              ({provider})
-                            </option>
-                          ))}
-                          <option value="__custom__">Custom provider id...</option>
-                        </select>
-                        {providerDraftId === "__custom__" ? (
-                          <input
-                            type="text"
-                            value={providerDraftCustomId}
-                            onChange={(e) => setProviderDraftCustomId(e.target.value)}
-                            onBlur={(e) => {
-                              const next = e.target.value.trim().toLowerCase();
-                              if (next) loadProviderDraft(next);
-                            }}
-                            placeholder="provider id (for example my-proxy)"
-                            aria-label="Custom provider ID"
-                            className="rounded-md border border-border bg-card px-2.5 py-1.5 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                          />
-                        ) : (
-                          <div className="rounded-md border border-border/50 bg-muted/20 px-2.5 py-1.5 text-xs text-muted-foreground">
-                            Editing <code>{providerDraftResolvedId}</code>
-                          </div>
-                        )}
-                      </div>
-
-                      <textarea
-                        value={providerDraftJson}
-                        onChange={(e) => setProviderDraftJson(e.target.value)}
-                        aria-label="Provider configuration (JSON)"
-                        className="mt-2 h-40 w-full rounded-md border border-border bg-card px-3 py-2 font-mono text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                      />
-                      {providerDraftError && (
-                        <p className="mt-2 text-xs text-red-500">{providerDraftError}</p>
-                      )}
-
-                      <div className="mt-2 flex flex-wrap items-center gap-2">
-                        <button
-                          type="button"
-                          onClick={applyProviderTemplate}
-                          disabled={!providerDraftResolvedId}
-                          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          Use template
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void saveProviderConfig()}
-                          disabled={!providerDraftResolvedId || Boolean(busyKey)}
-                          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          Save override
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => void removeProviderConfig(providerDraftResolvedId)}
-                          disabled={!providerDraftHasOverride || Boolean(busyKey)}
-                          className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/30 px-2.5 py-1.5 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          Remove current override
-                        </button>
-                      </div>
-                    </div>
-                  </div>
-                )}
-
-                {/* ── Tab 4: Aliases & Auth ── */}
-                {advancedTab === "aliases" && (
-                  <div className="space-y-6">
-                    {detailsLoading && (
-                      <p className="text-xs text-muted-foreground">
-                        <BusyDots /> Loading runtime alias and auth details...
-                      </p>
-                    )}
-
-                    {/* Model Aliases */}
-                    <div>
-                      <h3 className="text-xs font-semibold text-foreground mb-2">
-                        Model Aliases
-                      </h3>
-                      <p className="text-xs text-muted-foreground mb-3">
-                        Create short names for models. Use an alias anywhere you&apos;d use a full
-                        model key.
-                      </p>
-                      {Object.keys(aliases).length > 0 ? (
-                        <div className="flex flex-wrap gap-1.5 mb-3">
-                          {Object.entries(aliases).map(([alias, target]) => (
-                            <button
-                              key={`alias:${alias}`}
-                              type="button"
-                              onClick={() => {
-                                void runAction(
-                                  { action: "remove-alias", alias },
-                                  `Removed alias "${alias}"`,
-                                  `alias:remove:${alias}`,
-                                  { restart: false },
-                                );
-                              }}
-                              disabled={Boolean(busyKey)}
-                              className="inline-flex items-center gap-1 rounded-md border border-border bg-muted/40 px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-50"
-                            >
-                              <span className="font-semibold text-foreground">{alias}</span>
-                              <span className="text-muted-foreground/60">&rarr;</span>
-                              <span>{getFriendlyModelName(target)}</span>
-                              <Trash2 className="h-3 w-3 ml-1" />
-                            </button>
-                          ))}
-                        </div>
-                      ) : (
-                        <p className="text-xs text-muted-foreground/60 mb-3">
-                          No aliases configured.
-                        </p>
-                      )}
-                      <div className="grid gap-2 md:grid-cols-[1fr_1fr_auto]">
-                        <input
-                          type="text"
-                          value={aliasName}
-                          onChange={(e) => setAliasName(e.target.value)}
-                          placeholder="Alias name (e.g. fast)"
-                          aria-label="Alias name"
-                          className="rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                        />
-                        <select
-                          value={aliasTarget}
-                          onChange={(e) => setAliasTarget(e.target.value)}
-                          aria-label="Target model for alias"
-                          className="rounded-lg border border-border bg-muted/50 px-3 py-2 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                        >
-                          <option value="">Target model...</option>
-                          {allModelOptions
-                            .filter((opt) => opt.ready || opt.authConnected)
-                            .map((opt) => (
-                              <option key={`alias:target:${opt.key}`} value={opt.key}>
-                                {opt.name} · {opt.provider}
-                              </option>
-                            ))}
-                        </select>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (!aliasName.trim() || !aliasTarget) return;
-                            void runAction(
-                              { action: "set-alias", alias: aliasName.trim(), model: aliasTarget },
-                              `Alias "${aliasName.trim()}" created`,
-                              `alias:set:${aliasName.trim()}`,
-                              { restart: false },
-                            );
-                            setAliasName("");
-                            setAliasTarget("");
-                          }}
-                          disabled={!aliasName.trim() || !aliasTarget || Boolean(busyKey)}
-                          className="inline-flex items-center justify-center gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                        >
-                          <Plus className="h-3.5 w-3.5" />
-                          Add
-                        </button>
-                      </div>
-                    </div>
-
-                    {/* Auth Order Override */}
-                    <div>
-                      <h3 className="text-xs font-semibold text-foreground mb-2">
-                        Auth Order Override
-                      </h3>
-                      <p className="text-xs text-muted-foreground mb-3">
-                        Control which credential is tried first when multiple exist for the same
-                        provider.
-                      </p>
-                      <div className="rounded-lg border border-border/50 bg-muted/10 p-3">
-                        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                          <div className="flex items-center gap-2">
-                            {orderLoading ? (
-                              <span className="text-xs text-muted-foreground">
-                                <BusyDots /> Loading...
-                              </span>
-                            ) : (
-                              <StatusPill
-                                tone={orderDraft.length > 0 ? "warn" : "neutral"}
-                                label={
-                                  orderDraft.length > 0
-                                    ? "override active"
-                                    : "default rotation"
-                                }
-                              />
-                            )}
-                          </div>
-                        </div>
-
-                        <div className="grid gap-2 md:grid-cols-2 mb-2">
-                          <select
-                            value={orderAgentId}
-                            onChange={(e) => setOrderAgentId(e.target.value)}
-                            aria-label="Agent for auth order override"
-                            className="rounded-lg border border-border bg-muted/50 px-2.5 py-2 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                          >
-                            {sortedAgents.map((agent) => (
-                              <option key={`order:agent:${agent.id}`} value={agent.id}>
-                                {agent.name} ({agent.id})
-                              </option>
-                            ))}
-                          </select>
-                          <select
-                            value={orderProvider}
-                            onChange={(e) => setOrderProvider(e.target.value)}
-                            aria-label="Provider for auth order override"
-                            className="rounded-lg border border-border bg-muted/50 px-2.5 py-2 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                          >
-                            {availableProviders.map((provider) => (
-                              <option key={`order:provider:${provider}`} value={provider}>
-                                {provider}
-                              </option>
-                            ))}
-                          </select>
-                        </div>
-
-                        <div className="grid gap-2 md:grid-cols-[1fr_auto] mb-2">
-                          <select
-                            value={orderSelectedProfileId}
-                            onChange={(e) => setOrderSelectedProfileId(e.target.value)}
-                            aria-label="Select profile to add to auth order"
-                            className="rounded-lg border border-border bg-muted/50 px-2.5 py-2 text-xs text-foreground outline-none transition-colors focus:border-[var(--accent-brand-border)]"
-                          >
-                            <option value="">Select profile id...</option>
-                            {selectedOrderAgentProfiles.map((profileId) => (
-                              <option key={`order:profile:${profileId}`} value={profileId}>
-                                {profileId}
-                              </option>
-                            ))}
-                          </select>
-                          <button
-                            type="button"
-                            onClick={() => addOrderProfile(orderSelectedProfileId)}
-                            disabled={!orderSelectedProfileId || orderBusy}
-                            className="inline-flex items-center justify-center gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                          >
-                            <Plus className="h-3.5 w-3.5" />
-                            Add
-                          </button>
-                        </div>
-
-                        {orderError && (
-                          <p className="mb-2 text-xs text-amber-400">{orderError}</p>
-                        )}
-
-                        <div className="space-y-1.5">
-                          {orderDraft.length === 0 ? (
-                            <p className="text-xs text-muted-foreground/60">
-                              No override set for this provider/agent pair.
-                            </p>
-                          ) : (
-                            orderDraft.map((profileId, index) => (
-                              <div
-                                key={`order:draft:${profileId}`}
-                                className="flex items-center justify-between gap-2 rounded-md border border-border/60 bg-muted/20 px-2 py-1.5 text-xs"
-                              >
-                                <span className="text-foreground">{profileId}</span>
-                                <div className="flex items-center gap-1">
-                                  <button
-                                    type="button"
-                                    onClick={() => moveOrderProfile(profileId, -1)}
-                                    disabled={index === 0 || orderBusy}
-                                    className="rounded border border-border px-1.5 py-0.5 text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                  >
-                                    Up
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => moveOrderProfile(profileId, 1)}
-                                    disabled={index === orderDraft.length - 1 || orderBusy}
-                                    className="rounded border border-border px-1.5 py-0.5 text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                  >
-                                    Down
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => removeOrderProfile(profileId)}
-                                    disabled={orderBusy}
-                                    className="inline-flex items-center rounded border border-border px-1.5 py-0.5 text-xs text-muted-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                                  >
-                                    <Trash2 className="h-3 w-3" />
-                                  </button>
-                                </div>
-                              </div>
-                            ))
-                          )}
-                        </div>
-
-                        <div className="mt-3 flex flex-wrap items-center gap-2">
-                          <button
-                            type="button"
-                            onClick={() => void saveAuthOrder()}
-                            disabled={orderBusy || orderDraft.length === 0}
-                            className="inline-flex items-center gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                          >
-                            {orderBusy ? <BusyDots /> : <ListOrdered className="h-3.5 w-3.5" />}
-                            Save order
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => void clearAuthOrder()}
-                            disabled={orderBusy}
-                            className="inline-flex items-center gap-1 rounded-lg border border-border bg-muted/30 px-3 py-2 text-xs text-muted-foreground transition-colors hover:bg-muted/50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:opacity-40"
-                          >
-                            Clear override
-                          </button>
-                        </div>
-                      </div>
-                    </div>
-
-                    {/* Model Credentials summary */}
-                    <div>
-                      <button
-                        type="button"
-                        onClick={() => setAuthAuditOpen((prev) => !prev)}
-                        className="flex w-full items-center justify-between rounded-lg border border-border/60 bg-muted/10 px-3 py-2 text-left transition-colors hover:bg-muted/20 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                      >
-                        <div>
-                          <h3 className="text-xs font-semibold text-foreground">
-                            Model Auth Audit
-                          </h3>
-                          <p className="mt-1 text-xs text-muted-foreground">
-                            Deferred credential scan for providers, profiles, and per-agent auth.
-                          </p>
-                        </div>
-                        <div className="flex items-center gap-2">
-                          <StatusPill
-                            tone="good"
-                            label={`${modelCredentialSummary.connected}/${modelCredentialSummary.total} providers`}
-                          />
-                          <StatusPill
-                            tone="info"
-                            label={`${modelCredentialSummary.profiles} profiles`}
-                          />
-                          <ChevronDown
-                            className={cn(
-                              "h-4 w-4 text-muted-foreground transition-transform",
-                              authAuditOpen && "rotate-180",
-                            )}
-                          />
-                        </div>
-                      </button>
-
-                      {authAuditOpen && (
-                        <div className="mt-3 rounded-lg border border-border/50 bg-muted/10 p-3">
-                          <div className="mb-3 flex items-center justify-between gap-2">
-                            <div className="flex flex-wrap items-center gap-2 text-xs">
-                              <StatusPill
-                                tone="good"
-                                label={`${modelCredentialSummary.connected}/${modelCredentialSummary.total} providers`}
-                              />
-                              <StatusPill
-                                tone="info"
-                                label={`${modelCredentialSummary.profiles} profiles`}
-                              />
-                            </div>
-                            <button
-                              type="button"
-                              onClick={() => setRevealModelSecrets((prev) => !prev)}
-                              className="inline-flex items-center gap-1 rounded-md border border-border px-2 py-1 text-xs text-muted-foreground transition-colors hover:bg-muted/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-                            >
-                              {revealModelSecrets ? (
-                                <EyeOff className="h-3.5 w-3.5" />
-                              ) : (
-                                <Eye className="h-3.5 w-3.5" />
-                              )}
-                              {revealModelSecrets ? "Hide" : "Reveal"}
-                            </button>
-                          </div>
-
-                          {auditLoading && (
-                            <p className="mb-3 text-xs text-muted-foreground">
-                              <BusyDots /> Loading credential audit...
-                            </p>
-                          )}
-
-                          {modelCredsError && (
-                            <p className="mb-3 text-xs text-amber-400">
-                              <AlertTriangle className="mr-1 inline h-3 w-3" />
-                              {modelCredsError}
-                            </p>
-                          )}
-
-                          <div className="space-y-2">
-                            {modelAuthByAgent.length === 0 && !auditLoading ? (
-                              <p className="text-xs text-muted-foreground/60">
-                                No credential audit data available yet.
-                              </p>
-                            ) : (
-                              modelAuthByAgent.map((row) => (
-                                <div
-                                  key={row.agentId}
-                                  className="rounded-lg border border-border/50 bg-muted/10 p-2.5"
-                                >
-                                  <p className="text-xs font-medium text-foreground mb-1.5">
-                                    {agentNameById.get(row.agentId) || row.agentId}
-                                  </p>
-                                  <div className="flex flex-wrap gap-1.5">
-                                    {row.providers.map((provider) => (
-                                      <div
-                                        key={`${row.agentId}:${provider.provider}`}
-                                        className="rounded-md border border-border/40 bg-muted/20 px-2 py-1 text-xs"
-                                      >
-                                        <span className="font-medium text-foreground">
-                                          {provider.provider}
-                                        </span>
-                                        <span className="ml-1.5">
-                                          {provider.connected ? (
-                                            <span className="text-emerald-400">
-                                              {provider.effectiveKind || "connected"}
-                                            </span>
-                                          ) : (
-                                            <span className="text-muted-foreground/50">missing</span>
-                                          )}
-                                        </span>
-                                        {provider.envValue && revealModelSecrets && (
-                                          <p className="mt-0.5 break-all text-muted-foreground/50">
-                                            <code>
-                                              {provider.envSource}: {provider.envValue}
-                                            </code>
-                                          </p>
-                                        )}
-                                      </div>
-                                    ))}
-                                  </div>
-                                </div>
-                              ))
-                            )}
-                          </div>
-                        </div>
-                      )}
-                    </div>
-                  </div>
-                )}
-              </div>
-            </div>
-          )}
-        </section>
-      </SectionBody>
-
-      {/* ── Model Picker Modal ── */}
-      {pickerTarget && (
-        <ModelPicker
-          models={pickerModels}
-          currentModel={
-            pickerTarget.kind === "default"
-              ? defaultPrimary
-              : pickerTarget.kind === "image-model"
-                ? imageModel
-                : pickerTarget.kind === "heartbeat-model"
-                  ? heartbeatModel || defaultPrimary
-              : pickerTarget.kind === "agent"
-                ? pickerTarget.agent.modelPrimary || defaultPrimary
-                : undefined
-          }
-          excludeModels={pickerExcludeModels}
-          onConnectProvider={openProviderSetup}
-          connectableProviders={providerSetupOptions}
-          onSelect={handlePickerSelect}
-          onClose={() => setPickerTarget(null)}
-          title={pickerTitle}
+      {/* Add provider wizard modal */}
+      {showWizard && (
+        <AddProviderWizard
+          onClose={() => setShowWizard(false)}
+          onDone={handleWizardDone}
         />
       )}
 
-      {/* ── Toast ── */}
-      {toast && (
-        <div
-          className={cn(
-            "fixed bottom-6 right-6 z-50 flex items-center gap-2 rounded-lg border px-4 py-2.5 text-sm shadow-xl backdrop-blur-sm",
-            toast.type === "success"
-              ? "border-emerald-500/25 bg-emerald-500/12 text-emerald-700 dark:text-emerald-300"
-              : "border-red-500/25 bg-red-500/12 text-red-700 dark:text-red-300",
-          )}
-        >
-          {toast.type === "success" ? (
-            <Check className="h-3.5 w-3.5" />
-          ) : (
-            <AlertTriangle className="h-3.5 w-3.5" />
-          )}
-          {toast.message}
-        </div>
+      {/* Model picker modal (triggered from provider card) */}
+      {pickerProvider && (
+        <ModelPickerModal
+          provider={pickerProvider}
+          currentModel={primaryModel}
+          onClose={handlePickerClose}
+          onSelect={handlePickerClose}
+        />
       )}
-    </SectionLayout>
+
+      {/* Error toast */}
+      {toastMessage && (
+        <Toast message={toastMessage} onClose={() => setToastMessage(null)} />
+      )}
+    </>
   );
 }

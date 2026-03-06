@@ -41,6 +41,7 @@ import {
   Stethoscope,
   HelpCircle,
   Puzzle,
+  Rocket,
 } from "lucide-react";
 import { getChatUnreadCount, subscribeChatStore } from "@/lib/chat-store";
 
@@ -60,6 +61,7 @@ const isAgentbayHosting = process.env.NEXT_PUBLIC_AGENTBAY_HOSTED === "true";
 const navItems: NavItem[] = [
   // ── Overview ──
   { group: "Overview", section: "dashboard", label: "Dashboard", icon: LayoutDashboard, href: "/dashboard" },
+  { section: "setup", label: "Setup Guide", icon: Rocket, href: "/onboard" },
   { section: "activity", label: "Activity", icon: Activity, href: "/activity" },
   { section: "usage", label: "Usage", icon: BarChart3, href: "/usage" },
   // ── Agents ──
@@ -118,6 +120,7 @@ function deriveSectionFromPath(pathname: string): string | null {
     memories: "memory",
     permissions: "security",
     heartbeat: "cron",
+    onboard: "setup",
   };
   if (aliases[first]) return aliases[first];
   const known = new Set([
@@ -151,6 +154,7 @@ function deriveSectionFromPath(pathname: string): string | null {
     "config",
     "settings",
     "activity",
+    "setup",
     "help",
   ]);
   return known.has(first) ? first : null;

@@ -43,7 +43,7 @@ type ProviderId =
   | "mistral"
   | "custom";
 
-type ChannelId = "telegram" | "discord" | "whatsapp" | "signal" | "slack";
+type ChannelId = "telegram" | "discord" | "whatsapp";
 
 type ModelItem = {
   id: string;
@@ -228,29 +228,6 @@ const CHANNELS: ChannelDef[] = [
     description: "WhatsApp requires a QR code scan from your phone.",
     nextSteps: "Scan the QR code, then send a message from your phone number to complete pairing.",
     docsUrl: "https://docs.openclaw.ai/channels/whatsapp",
-  },
-  {
-    id: "signal",
-    label: "Signal",
-    icon: "🔒",
-    setupType: "manual",
-    description: "Signal setup is manual. Link and configure signal-cli first, then add the channel from the full Channels page.",
-    nextSteps: "Open the Signal setup guide, finish the signal-cli registration steps, then return to Channels to verify the runtime.",
-    docsUrl: "https://docs.openclaw.ai/channels/signal",
-  },
-  {
-    id: "slack",
-    label: "Slack",
-    icon: "💼",
-    setupType: "token",
-    tokenLabel: "Bot Token",
-    tokenPlaceholder: "xoxb-...",
-    appTokenLabel: "App Token",
-    appTokenPlaceholder: "xapp-...",
-    requiresAppToken: true,
-    description: "Connect your Slack bot token and Socket Mode app token so your workspace can chat with the agent.",
-    nextSteps: "Message the Slack bot in a DM or channel so the pairing approval appears here.",
-    docsUrl: "https://docs.openclaw.ai/channels/slack",
   },
 ];
 
@@ -487,6 +464,11 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
   const [pairingRequests, setPairingRequests] = useState<PairingRequest[]>([]);
   const [approvingCode, setApprovingCode] = useState<string | null>(null);
   const [approvedCodes, setApprovedCodes] = useState<Set<string>>(new Set());
+  const [connectPhase, setConnectPhase] = useState<
+    "idle" | "validating" | "saving" | "restarting" | "ready"
+  >("idle");
+  const [botName, setBotName] = useState("");
+  const [pairingTimeout, setPairingTimeout] = useState(false);
 
   const [launchError, setLaunchError] = useState<string | null>(null);
   const [showSkipConfirm, setShowSkipConfirm] = useState(false);
@@ -495,6 +477,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
   const validationSeqRef = useRef(0);
   const modelFetchSeqRef = useRef(0);
   const pairingPollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const pairingTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
   const currentProvider = useMemo(
     () => PROVIDERS.find((entry) => entry.id === provider) || PROVIDERS[0],
@@ -763,14 +746,43 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     }
   }, [saveCredentials]);
 
+  const waitForGatewayHealth = useCallback(async (maxAttempts = 15): Promise<boolean> => {
+    for (let i = 0; i < maxAttempts; i++) {
+      try {
+        const res = await fetch("/api/channels/health", { cache: "no-store" });
+        if (res.ok) return true;
+      } catch { /* retry */ }
+      await new Promise((r) => setTimeout(r, 2000));
+    }
+    return false;
+  }, []);
+
   const handleConnectChannel = useCallback(async () => {
     if (!currentChannel || currentChannel.setupType !== "token" || !channelToken.trim()) return;
     if (currentChannel.requiresAppToken && !channelAppToken.trim()) return;
 
     setChannelBusy(true);
     setChannelResult(null);
+    setConnectPhase("validating");
+    setBotName("");
+    setPairingTimeout(false);
+    if (pairingTimeoutRef.current) clearTimeout(pairingTimeoutRef.current);
 
     try {
+      // Phase 1: Validate token
+      const valRes = await fetch("/api/channels/validate", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ channel: currentChannel.id, token: channelToken.trim() }),
+      });
+      const valData = await valRes.json();
+      if (valData.ok === false) {
+        throw new Error(valData.error || "Token validation failed.");
+      }
+      if (valData.botName) setBotName(valData.botName);
+
+      // Phase 2: Save config
+      setConnectPhase("saving");
       const res = await fetch("/api/channels", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -786,14 +798,28 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
         throw new Error(data.error || `Could not connect ${currentChannel.label}.`);
       }
 
+      // Phase 3: Wait for gateway restart
+      setConnectPhase("restarting");
+      const healthy = await waitForGatewayHealth();
+      if (!healthy) {
+        throw new Error("Gateway did not come back online. Check the logs.");
+      }
+
+      setConnectPhase("ready");
       setChannelResult({
         type: "success",
-        message: `${currentChannel.label} connected successfully!`,
+        message: `${currentChannel.label} connected${valData.botName ? ` (${valData.botName})` : ""}!`,
       });
       setConnectedChannel(currentChannel.id);
       setApprovedCodes(new Set());
       setPairingRequests([]);
+
+      // Start 2-minute pairing timeout
+      pairingTimeoutRef.current = setTimeout(() => {
+        setPairingTimeout(true);
+      }, 120000);
     } catch (error) {
+      setConnectPhase("idle");
       setChannelResult({
         type: "error",
         message: error instanceof Error ? error.message : `Could not connect ${currentChannel.label}.`,
@@ -801,7 +827,7 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     } finally {
       setChannelBusy(false);
     }
-  }, [channelAppToken, channelToken, currentChannel]);
+  }, [channelAppToken, channelToken, currentChannel, waitForGatewayHealth]);
 
   const handleApprovePairing = useCallback(async (request: PairingRequest) => {
     setApprovingCode(request.code);
@@ -873,6 +899,10 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
     setChannelResult(null);
     setPairingRequests([]);
     setApprovedCodes(new Set());
+    setConnectPhase("idle");
+    setBotName("");
+    setPairingTimeout(false);
+    if (pairingTimeoutRef.current) clearTimeout(pairingTimeoutRef.current);
   }, []);
 
   const visibleStepIndex = step === "model" ? 0 : step === "channel" ? 1 : 1;
@@ -1173,12 +1203,32 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                               : "bg-primary text-primary-foreground hover:opacity-90",
                           )}
                         >
-                          {channelBusy ? <TypingDots size="sm" className="text-current" /> : "Connect"}
+                          {channelBusy ? (
+                            <span className="flex items-center gap-1.5">
+                              <TypingDots size="sm" className="text-current" />
+                              <span>
+                                {connectPhase === "validating" ? "Validating..." :
+                                 connectPhase === "saving" ? "Saving..." :
+                                 connectPhase === "restarting" ? "Starting..." :
+                                 "Connecting..."}
+                              </span>
+                            </span>
+                          ) : "Connect"}
                         </button>
                       </div>
                       {channelResult?.type === "success" ? (
                         <p className="text-xs text-emerald-400">{channelResult.message}</p>
                       ) : null}
+                      {channelResult?.type === "success" && connectedChannel === "telegram" && (
+                        <a
+                          href={`https://t.me/${channelResult.message.match(/@(\w+)/)?.[1] || ""}`}
+                          target="_blank"
+                          rel="noopener noreferrer"
+                          className="inline-flex items-center gap-1.5 text-xs text-emerald-400 hover:text-emerald-300 transition-colors"
+                        >
+                          <ExternalLink className="h-3 w-3" /> Open in Telegram to test
+                        </a>
+                      )}
                       {channelResult?.type === "error" ? (
                         <p className="text-xs text-red-400">Error: {channelResult.message}</p>
                       ) : null}
@@ -1272,29 +1322,41 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                       <CheckCircle className="h-7 w-7 text-emerald-400" />
                     </div>
                     <p className="text-sm font-medium text-emerald-300">
-                      {connectedChannelDef.icon} {connectedChannelDef.label} connected
+                      {connectedChannelDef.icon} {connectedChannelDef.label} connected{botName ? ` (${botName})` : ""}
                     </p>
                   </div>
 
+                  {/* Prompt user to text the bot */}
                   <div className="rounded-xl border border-border bg-secondary/50 p-4 space-y-3">
                     <div>
-                      <p className="text-xs font-medium text-foreground/80">What to do next</p>
+                      <p className="text-xs font-medium text-foreground/80">Now test the connection</p>
                       <p className="mt-1 text-xs leading-relaxed text-muted-foreground">
-                        {connectedChannelDef.nextSteps}
+                        Open {connectedChannelDef.label} and send a message to your bot.
+                        You will receive a pairing code — then confirm it here.
                       </p>
                     </div>
 
+                    {/* Waiting state */}
                     {!approvalComplete && pairingRequests.length === 0 ? (
-                      <div className="flex items-center gap-2">
-                        <TypingDots size="sm" className="text-muted-foreground/60" />
-                        <span className="text-xs text-muted-foreground/60">
-                          Waiting for someone to message your bot...
-                        </span>
+                      <div className="space-y-2">
+                        <div className="flex items-center gap-2 py-1">
+                          <TypingDots size="sm" className="text-violet-400/60" />
+                          <span className="text-xs text-muted-foreground">
+                            Waiting for a message to your bot...
+                          </span>
+                        </div>
+                        {pairingTimeout && (
+                          <div className="rounded-md border border-amber-500/20 bg-amber-500/10 px-2.5 py-2 text-xs text-amber-300">
+                            No pairing request detected yet. Make sure you sent a message to the correct bot.
+                            {" "}If the problem persists, go back and re-enter the token.
+                          </div>
+                        )}
                       </div>
                     ) : null}
 
-                    {pairingRequests.length > 0 ? (
-                      <p className="text-xs font-medium text-emerald-400">New contact detected!</p>
+                    {/* Pairing request detected */}
+                    {pairingRequests.length > 0 && !approvalComplete ? (
+                      <p className="text-xs font-semibold text-emerald-400">Pairing request received!</p>
                     ) : null}
 
                     {pairingRequests.map((request) => {
@@ -1302,43 +1364,51 @@ export function OnboardingWizard({ onComplete }: { onComplete?: () => void }) {
                       return (
                         <div
                           key={request.code}
-                          className="flex items-center justify-between gap-3 rounded-lg border border-border bg-card p-3"
+                          className="rounded-lg border border-emerald-500/20 bg-emerald-500/5 p-3"
                         >
-                          <div className="min-w-0 flex-1">
-                            <p className="truncate text-xs font-medium text-foreground">
-                              {request.senderName || "Unknown sender"}
-                            </p>
-                            {request.message ? (
-                              <p className="truncate text-xs text-muted-foreground">“{request.message}”</p>
-                            ) : null}
-                          </div>
-                          {approved ? (
-                            <div className="flex items-center gap-1.5 text-xs text-emerald-400">
-                              <CheckCircle className="h-3.5 w-3.5" />
-                              Approved
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => handleApprovePairing(request)}
-                              disabled={approvingCode === request.code}
-                              className="rounded-full bg-primary px-4 py-1.5 text-xs font-medium text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60"
-                            >
-                              {approvingCode === request.code ? (
-                                <TypingDots size="sm" className="text-current" />
-                              ) : (
-                                "Approve"
+                          <div className="flex items-center justify-between gap-3">
+                            <div className="min-w-0 flex-1">
+                              <p className="text-xs font-medium text-foreground">
+                                {request.senderName || "Unknown sender"}
+                              </p>
+                              <p className="mt-0.5 text-xs text-muted-foreground">
+                                Pairing code: <code className="rounded bg-violet-500/15 px-1.5 py-0.5 font-bold tracking-wider text-violet-300">{request.code}</code>
+                              </p>
+                              {!approved && (
+                                <p className="mt-1 text-xs text-muted-foreground/60">
+                                  Confirm this matches the code you received in {connectedChannelDef.label}.
+                                </p>
                               )}
-                            </button>
-                          )}
+                            </div>
+                            {approved ? (
+                              <div className="flex items-center gap-1.5 text-xs text-emerald-400">
+                                <CheckCircle className="h-3.5 w-3.5" />
+                                Approved
+                              </div>
+                            ) : (
+                              <button
+                                type="button"
+                                onClick={() => handleApprovePairing(request)}
+                                disabled={approvingCode === request.code}
+                                className="shrink-0 rounded-full bg-primary px-5 py-2 text-xs font-semibold text-primary-foreground transition-opacity hover:opacity-90 disabled:opacity-60"
+                              >
+                                {approvingCode === request.code ? (
+                                  <TypingDots size="sm" className="text-current" />
+                                ) : (
+                                  "Confirm & Approve"
+                                )}
+                              </button>
+                            )}
+                          </div>
                         </div>
                       );
                     })}
 
+                    {/* Success state */}
                     {approvalComplete ? (
                       <div className="flex items-center gap-1.5 text-xs text-emerald-400">
                         <CheckCircle className="h-3.5 w-3.5" />
-                        Approved! You can now chat with your agent.
+                        Approved! Your agent is now connected to {connectedChannelDef.label}.
                       </div>
                     ) : null}
                   </div>

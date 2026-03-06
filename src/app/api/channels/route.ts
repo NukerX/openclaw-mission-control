@@ -1,543 +1,160 @@
 import { NextRequest, NextResponse } from "next/server";
 import { readFile } from "fs/promises";
 import { join } from "path";
-import { runCli, gatewayCall } from "@/lib/openclaw";
-import { fetchConfig, patchConfig } from "@/lib/gateway-config";
+import { gatewayCall } from "@/lib/openclaw";
+import { patchConfig } from "@/lib/gateway-config";
 import { getOpenClawHome } from "@/lib/paths";
 
 export const dynamic = "force-dynamic";
 
-/* ── Types ── */
+/* ── Helpers ── */
 
-type ChannelListLegacyItem = {
-  channel: string;
-  enabled: boolean;
-  accounts: string[];
-};
+function isRecord(v: unknown): v is Record<string, unknown> {
+  return Boolean(v) && typeof v === "object" && !Array.isArray(v);
+}
 
-type ChannelStatusLegacyItem = {
-  channel: string;
-  account: string;
-  status: string;
-  linked?: boolean;
-  connected?: boolean;
-  error?: string;
-};
+function toStr(v: unknown): string | undefined {
+  return typeof v === "string" ? v : undefined;
+}
 
-type ChannelStatusRuntime = {
-  channel: string;
-  account: string;
-  status: string;
-  linked?: boolean;
-  connected?: boolean;
-  error?: string;
-};
+/* ── Channel catalog (the three we support) ── */
 
-type NormalizedChannel = {
-  channel: string;
+const CHANNELS = [
+  {
+    id: "telegram",
+    label: "Telegram",
+    icon: "telegram",
+    setup: "token" as const,
+    tokenLabel: "Bot Token",
+    tokenPlaceholder: "123456:ABC-DEF1234ghIkl...",
+    hint: "Create a bot with @BotFather in Telegram, then paste the token here.",
+    docsUrl: "https://docs.openclaw.ai/channels/telegram",
+  },
+  {
+    id: "discord",
+    label: "Discord",
+    icon: "discord",
+    setup: "token" as const,
+    tokenLabel: "Bot Token",
+    tokenPlaceholder: "MTIzNDU2Nzg5MDEyMzQ1...",
+    hint: "Create a bot in the Discord Developer Portal, enable Message Content Intent, then paste the token.",
+    docsUrl: "https://docs.openclaw.ai/channels/discord",
+  },
+  {
+    id: "whatsapp",
+    label: "WhatsApp",
+    icon: "whatsapp",
+    setup: "qr" as const,
+    hint: "Scan a QR code with the WhatsApp app on the phone you want to use.",
+    docsUrl: "https://docs.openclaw.ai/channels/whatsapp",
+  },
+] as const;
+
+/* ── Read config from disk (fallback when gateway RPC unavailable) ── */
+
+async function readChannelsConfig(): Promise<Record<string, unknown>> {
+  const home = getOpenClawHome();
+  for (const p of [join(home, "openclaw.json"), join(home, ".openclaw", "openclaw.json")]) {
+    try {
+      const raw = await readFile(p, "utf-8");
+      const parsed = JSON.parse(raw);
+      if (isRecord(parsed) && isRecord(parsed.channels)) return parsed.channels;
+    } catch {
+      /* try next */
+    }
+  }
+  return {};
+}
+
+/* ── Build channel status from gateway + config ── */
+
+type ChannelStatus = {
+  id: string;
+  label: string;
+  icon: string;
+  setup: "token" | "qr";
+  tokenLabel?: string;
+  tokenPlaceholder?: string;
+  hint: string;
+  docsUrl: string;
   enabled: boolean;
   configured: boolean;
-  hasConfig: boolean;
-  accounts: string[];
-  statuses: ChannelStatusRuntime[];
+  connected: boolean;
+  error?: string;
   dmPolicy?: string;
   groupPolicy?: string;
+  accounts: string[];
 };
 
-type PluginListItem = {
-  id: string;
-  enabled: boolean;
-  status?: string;
-  error?: string | null;
-  channelIds?: string[];
-};
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
-}
-
-function toStr(value: unknown): string | undefined {
-  return typeof value === "string" ? value : undefined;
-}
-
-function uniqueStrings(values: Array<string | undefined>): string[] {
-  return Array.from(new Set(values.filter((v): v is string => Boolean(v))));
-}
-
-function deriveAccountStatus(row: Record<string, unknown>): string {
-  if (row.running === true) return "connected";
-  if (typeof row.lastError === "string" && row.lastError.trim().length > 0) return "error";
-  if (row.enabled === false) return "disabled";
-  if (row.configured === false) return "not-configured";
-  return "idle";
-}
-
-async function listPlugins(): Promise<PluginListItem[]> {
-  try {
-    const configData = await fetchConfig(15000);
-    const resolved = configData.resolved;
-    const plugins = (resolved as Record<string, unknown>).plugins;
-    if (!plugins || !isRecord(plugins)) return [];
-    const entries = isRecord(plugins.entries) ? plugins.entries : {};
-    return Object.entries(entries)
-      .filter(([, v]) => isRecord(v))
-      .map(([id, v]) => {
-        const entry = v as Record<string, unknown>;
-        return {
-          id,
-          enabled: Boolean(entry.enabled),
-          status: typeof entry.status === "string" ? entry.status : undefined,
-          error: typeof entry.error === "string" ? entry.error : entry.error == null ? null : String(entry.error),
-          channelIds: Array.isArray(entry.channelIds) ? entry.channelIds.map((cid) => String(cid)) : [],
-        };
-      })
-      .filter((plugin) => plugin.id.length > 0);
-  } catch {
-    return [];
-  }
-}
-
-function findPluginForChannel(
-  plugins: PluginListItem[],
-  channel: string
-): PluginListItem | null {
-  const target = String(channel || "").trim().toLowerCase();
-  if (!target) return null;
-  const exact = plugins.find((plugin) => plugin.id.toLowerCase() === target);
-  if (exact) return exact;
-  return (
-    plugins.find((plugin) =>
-      (plugin.channelIds || []).some((id) => id.toLowerCase() === target)
-    ) || null
-  );
-}
-
-async function ensureChannelPluginReady(channel: string): Promise<{
-  autoEnabled: boolean;
-  note?: string;
-}> {
-  const plugins = await listPlugins();
-  if (plugins.length === 0) {
-    return { autoEnabled: false };
-  }
-
-  const plugin = findPluginForChannel(plugins, channel);
-  if (!plugin) {
-    return { autoEnabled: false };
-  }
-
-  if (plugin.enabled && plugin.status === "error") {
-    throw new Error(
-      `Channel plugin "${plugin.id}" is enabled but failed to load: ${plugin.error || "unknown error"}`
-    );
-  }
-
-  if (plugin.enabled) {
-    return { autoEnabled: false };
-  }
-
-  await patchConfig({ plugins: { entries: { [plugin.id]: { enabled: true } } } });
-  return {
-    autoEnabled: true,
-    note: `Enabled plugin "${plugin.id}" automatically. Restart the gateway to activate the channel runtime.`,
-  };
-}
-
-function isUnknownChannelError(error: unknown, channel: string): boolean {
-  const msg = String(error || "").toLowerCase();
-  const target = String(channel || "").toLowerCase();
-  if (!target) return false;
-  return msg.includes(`unknown channel: ${target}`) || msg.includes(`unknown channel "${target}"`);
-}
-
-async function explainUnknownChannelError(
-  channel: string,
-  originalError: unknown
-): Promise<never> {
-  const plugins = await listPlugins();
-  const plugin = findPluginForChannel(plugins, channel);
-  if (!plugin) {
-    const docsUrl = `https://docs.openclaw.ai/channels/${encodeURIComponent(channel)}`;
-    throw new Error(
-      `Unknown channel "${channel}" in this OpenClaw installation. Telegram and several other channels are built-in — ensure OpenClaw is up to date (openclaw --version) and the gateway is running. Some channels require a plugin; run "openclaw plugins list" to see. See ${docsUrl} for setup.`
-    );
-  }
-  if (!plugin.enabled) {
-    throw new Error(
-      `Channel plugin "${plugin.id}" is installed but disabled. Enable it with "openclaw plugins enable ${plugin.id}", then retry setup.`
-    );
-  }
-  if (plugin.status === "error") {
-    throw new Error(
-      `Channel plugin "${plugin.id}" failed to load: ${plugin.error || "unknown error"}`
-    );
-  }
-  throw new Error(String(originalError));
-}
-
-function normalizeChannels(
-  channelListRaw: unknown,
-  statusRaw: unknown,
-  channelsConfig: Record<string, unknown>
-): NormalizedChannel[] {
-  const listObj = isRecord(channelListRaw) ? channelListRaw : {};
-  const statusObj = isRecord(statusRaw) ? statusRaw : {};
-
-  // Legacy schema support:
-  // channels list -> { channels: [{ channel, enabled, accounts }] }
-  // channels status -> { channels: [{ channel, account, status, ... }] }
-  const legacyList = Array.isArray(listObj.channels)
-    ? (listObj.channels as unknown[]).filter((row): row is ChannelListLegacyItem => {
-        if (!isRecord(row)) return false;
-        return typeof row.channel === "string";
-      })
-    : [];
-  if (legacyList.length > 0) {
-    const legacyStatuses = Array.isArray(statusObj.channels)
-      ? (statusObj.channels as unknown[]).filter((row): row is ChannelStatusLegacyItem => {
-          if (!isRecord(row)) return false;
-          return typeof row.channel === "string";
-        })
-      : [];
-    return legacyList.map((ch) => {
-      const statuses = legacyStatuses.filter((s) => s.channel === ch.channel);
-      const hasConfig = Boolean(channelsConfig[ch.channel]);
-      const accounts = Array.isArray(ch.accounts) ? ch.accounts.map((a) => String(a)) : [];
-      const configured = hasConfig || accounts.length > 0 || statuses.length > 0 || Boolean(ch.enabled);
-      return {
-        channel: ch.channel,
-        enabled: Boolean(ch.enabled),
-        configured,
-        hasConfig,
-        accounts,
-        statuses: statuses.map((s) => ({
-          channel: s.channel,
-          account: s.account,
-          status: s.status,
-          linked: s.linked,
-          connected: s.connected,
-          error: s.error,
-        })),
-      };
-    });
-  }
-
-  // Modern schema support:
-  // channels list -> { chat: { telegram: ["default"] } ... }
-  // channels status -> { channels: {...}, channelAccounts: { telegram: [{accountId,...}] } }
-  const chatMap = isRecord(listObj.chat) ? listObj.chat : {};
-  const statusChannels = isRecord(statusObj.channels) ? statusObj.channels : {};
-  const statusAccounts = isRecord(statusObj.channelAccounts) ? statusObj.channelAccounts : {};
-
-  const channelIds = new Set<string>([
-    ...Object.keys(chatMap),
-    ...Object.keys(statusChannels),
-    ...Object.keys(statusAccounts),
-    ...Object.keys(channelsConfig),
+async function buildChannelStatuses(): Promise<ChannelStatus[]> {
+  // Fetch gateway status + config in parallel
+  const [statusResult, configResult, diskConfig] = await Promise.all([
+    gatewayCall<Record<string, unknown>>("channels.status", {}, 10000).catch(() => ({})),
+    gatewayCall<Record<string, unknown>>("config.get", undefined, 10000).catch(() => null),
+    readChannelsConfig(),
   ]);
 
-  const out: NormalizedChannel[] = [];
-  for (const channel of channelIds) {
-    const configEntry = isRecord(channelsConfig[channel]) ? channelsConfig[channel] : undefined;
-    const hasConfig = Boolean(configEntry);
+  // Extract channel config from gateway or disk
+  const resolved = isRecord(configResult?.resolved) ? configResult.resolved : {};
+  const channelsConfig = isRecord(resolved.channels)
+    ? resolved.channels
+    : diskConfig;
 
-    const chatAccounts = Array.isArray(chatMap[channel])
-      ? (chatMap[channel] as unknown[]).map((a) => String(a))
+  // Extract runtime status
+  const statusAccounts = isRecord(statusResult)
+    ? (isRecord(statusResult.channelAccounts) ? statusResult.channelAccounts : {})
+    : {};
+  const statusChannels = isRecord(statusResult)
+    ? (isRecord(statusResult.channels) ? statusResult.channels : {})
+    : {};
+
+  return CHANNELS.map((ch) => {
+    const conf = isRecord(channelsConfig[ch.id]) ? (channelsConfig[ch.id] as Record<string, unknown>) : null;
+    const accountRows = Array.isArray(statusAccounts[ch.id])
+      ? (statusAccounts[ch.id] as unknown[]).filter(isRecord)
       : [];
+    const chStatus = isRecord(statusChannels[ch.id]) ? (statusChannels[ch.id] as Record<string, unknown>) : null;
 
-    const accountRows = Array.isArray(statusAccounts[channel])
-      ? (statusAccounts[channel] as unknown[]).filter(isRecord)
-      : [];
+    const connected = accountRows.some((r) => r.running === true) || chStatus?.running === true;
+    const hasToken = conf ? Boolean(conf.botToken || conf.token) : false;
+    const enabled = conf ? conf.enabled !== false : false;
+    const configured = enabled && (
+      hasToken ||
+      connected ||
+      accountRows.some((r) => r.configured === true) ||
+      chStatus?.configured === true ||
+      (ch.setup === "qr" && accountRows.length > 0)
+    );
+    const error = accountRows.find((r) => typeof r.lastError === "string" && r.lastError.trim())?.lastError as string | undefined;
+    const accounts = accountRows.map((r) => toStr(r.accountId) || "default");
 
-    const statuses: ChannelStatusRuntime[] = accountRows.map((row) => ({
-      channel,
-      account: toStr(row.accountId) || "default",
-      status: deriveAccountStatus(row),
-      linked: row.configured === true,
-      connected: row.running === true,
-      error: toStr(row.lastError),
-    }));
-
-    const statusSummary = isRecord(statusChannels[channel]) ? statusChannels[channel] : {};
-    const accountIds = uniqueStrings([
-      ...chatAccounts,
-      ...statuses.map((s) => s.account),
-    ]);
-
-    const enabledFromConfig = hasConfig
-      ? ((configEntry as Record<string, unknown>).enabled as boolean | undefined) !== false
-      : undefined;
-
-    const enabled =
-      typeof enabledFromConfig === "boolean"
-        ? enabledFromConfig
-        : statuses.some((s) => s.connected || s.status === "idle") ||
-          statusSummary.running === true ||
-          statusSummary.configured === true ||
-          chatAccounts.length > 0;
-
-    const configured =
-      hasConfig ||
-      statusSummary.configured === true ||
-      statuses.some((s) => s.linked || s.connected) ||
-      chatAccounts.length > 0;
-
-    out.push({
-      channel,
+    return {
+      ...ch,
       enabled,
       configured,
-      hasConfig,
-      accounts: accountIds.length > 0 ? accountIds : configured ? ["default"] : [],
-      statuses,
-      dmPolicy: configEntry && typeof (configEntry as Record<string, unknown>).dmPolicy === "string"
-        ? (configEntry as Record<string, unknown>).dmPolicy as string
-        : undefined,
-      groupPolicy: configEntry && typeof (configEntry as Record<string, unknown>).groupPolicy === "string"
-        ? (configEntry as Record<string, unknown>).groupPolicy as string
-        : undefined,
-    });
-  }
-
-  return out;
+      connected,
+      error,
+      dmPolicy: toStr(conf?.dmPolicy),
+      groupPolicy: toStr(conf?.groupPolicy),
+      accounts: accounts.length > 0 ? accounts : configured ? ["default"] : [],
+    };
+  });
 }
 
-async function readChannelsConfigFallback(): Promise<Record<string, unknown>> {
+/* ── GET /api/channels ── */
+
+export async function GET() {
   try {
-    const configPath = join(getOpenClawHome(), "openclaw.json");
-    const raw = await readFile(configPath, "utf-8");
-    const parsed = JSON.parse(raw);
-    if (!isRecord(parsed)) return {};
-    const channels = parsed.channels;
-    return isRecord(channels) ? channels : {};
-  } catch {
-    return {};
-  }
-}
-
-/**
- * GET /api/channels
- *
- * Query params:
- *   scope=list    - list configured channels (default)
- *   scope=status  - runtime status of all channels
- *   scope=all     - combined: configured channels + status + setup hints
- */
-export async function GET(request: NextRequest) {
-  const { searchParams } = new URL(request.url);
-  const scope = searchParams.get("scope") || "list";
-
-  try {
-    if (scope === "all" || scope === "list") {
-      // Get runtime status + config in parallel. channels.list is not advertised
-      // by the current gateway, so derive the catalog from status + config.
-      const [statusResult, configResult, localChannelsConfig] = await Promise.all([
-        gatewayCall<Record<string, unknown>>("channels.status", {}, 10000).catch(() => ({})),
-        gatewayCall<Record<string, unknown>>("config.get", undefined, 10000).catch(() => null),
-        readChannelsConfigFallback(),
-      ]);
-
-      // Extract channel config from gateway; if unavailable, fall back to local config file.
-      const resolved = isRecord(configResult?.resolved) ? configResult.resolved : {};
-      const parsed = isRecord(configResult?.parsed) ? configResult.parsed : {};
-      const resolvedChannels = isRecord(resolved.channels) ? resolved.channels : {};
-      const parsedChannels = isRecord(parsed.channels) ? parsed.channels : {};
-      const channelsConfig =
-        Object.keys(resolvedChannels).length > 0
-          ? resolvedChannels
-          : Object.keys(parsedChannels).length > 0
-            ? parsedChannels
-            : localChannelsConfig;
-
-      // Build enriched channel info from modern + legacy schemas.
-      const channels = normalizeChannels({}, statusResult, channelsConfig);
-
-      // Also include known channels that might not be in `channels list` yet
-      // (user may want to set them up)
-      const KNOWN_CHANNELS = [
-        {
-          channel: "whatsapp",
-          label: "WhatsApp",
-          icon: "💬",
-          setupType: "qr" as const,
-          setupCommand: "openclaw channels login --channel whatsapp",
-          setupHint: "Requires QR code scan from your phone. Uses WhatsApp Web (Baileys).",
-          configHint: "Recommended: use a separate phone number for OpenClaw.",
-          docsUrl: "https://docs.openclaw.ai/channels/whatsapp",
-        },
-        {
-          channel: "telegram",
-          label: "Telegram",
-          icon: "✈️",
-          setupType: "token" as const,
-          setupCommand: "openclaw channels add --channel telegram --token <BOT_TOKEN>",
-          setupHint: "Create a bot via https://t.me/BotFather, then paste the token.",
-          configHint: "Fastest channel to set up. Supports groups, topics, inline buttons.",
-          tokenLabel: "Bot Token",
-          tokenPlaceholder: "123456:ABC-DEF1234ghIkl...",
-          docsUrl: "https://docs.openclaw.ai/channels/telegram",
-        },
-        {
-          channel: "discord",
-          label: "Discord",
-          icon: "🎮",
-          setupType: "token" as const,
-          setupCommand: "openclaw channels add --channel discord --token <BOT_TOKEN>",
-          setupHint: "Create a Discord bot at https://discord.com/developers/applications then paste the token.",
-          configHint: "Supports servers, channels, and DMs.",
-          tokenLabel: "Bot Token",
-          tokenPlaceholder: "MTIzNDU2Nzg5MDEyMzQ1...",
-          docsUrl: "https://docs.openclaw.ai/channels/discord",
-        },
-        {
-          channel: "slack",
-          label: "Slack",
-          icon: "💼",
-          setupType: "token" as const,
-          setupCommand: "openclaw channels add --channel slack --token <BOT_TOKEN> --app-token <APP_TOKEN>",
-          setupHint: "Create a Slack app at https://api.slack.com/apps with Socket Mode enabled, then provide both the bot token and the app token.",
-          configHint: "Requires both xoxb bot token and xapp Socket Mode app token.",
-          tokenLabel: "Bot Token",
-          tokenPlaceholder: "xoxb-...",
-          docsUrl: "https://docs.openclaw.ai/channels/slack",
-        },
-        {
-          channel: "signal",
-          label: "Signal",
-          icon: "🔒",
-          setupType: "cli" as const,
-          setupCommand: "",
-          setupHint: "Manual setup required. Link signal-cli and configure the Signal channel using the official docs.",
-          configHint: "Mission Control does not complete Signal registration in-app.",
-          docsUrl: "https://docs.openclaw.ai/channels/signal",
-        },
-        {
-          channel: "bluebubbles",
-          label: "iMessage",
-          icon: "🍎",
-          setupType: "token" as const,
-          setupCommand: "openclaw channels add --channel bluebubbles --token <PASSWORD>",
-          setupHint: "Requires BlueBubbles macOS server running. Enter the server password.",
-          configHint: "Recommended for iMessage. Full feature support.",
-          tokenLabel: "Server Password",
-          tokenPlaceholder: "your-bluebubbles-password",
-          docsUrl: "https://docs.openclaw.ai/channels/bluebubbles",
-        },
-        {
-          channel: "mattermost",
-          label: "Mattermost",
-          icon: "📡",
-          setupType: "token" as const,
-          setupCommand: "openclaw channels add --channel mattermost --token <BOT_TOKEN>",
-          setupHint: "Create a bot in Mattermost and paste the token.",
-          configHint: "Bot API + WebSocket. Supports channels, groups, DMs.",
-          tokenLabel: "Bot Token",
-          tokenPlaceholder: "...",
-          docsUrl: "https://docs.openclaw.ai/channels/mattermost",
-        },
-        {
-          channel: "googlechat",
-          label: "Google Chat",
-          icon: "💬",
-          setupType: "cli" as const,
-          setupCommand: "openclaw channels add --channel googlechat",
-          setupHint: "Requires Google Chat API app configuration.",
-          configHint: "Google Chat API app via HTTP webhook.",
-          docsUrl: "https://docs.openclaw.ai/channels/googlechat",
-        },
-        {
-          channel: "matrix",
-          label: "Matrix",
-          icon: "🔗",
-          setupType: "cli" as const,
-          setupCommand: "openclaw channels add --channel matrix",
-          setupHint: "Matrix protocol. Plugin, installed separately.",
-          configHint: "Decentralized messaging.",
-          docsUrl: "https://docs.openclaw.ai/channels/matrix",
-        },
-        {
-          channel: "irc",
-          label: "IRC",
-          icon: "📺",
-          setupType: "cli" as const,
-          setupCommand: "openclaw channels add --channel irc",
-          setupHint: "Classic IRC. Channels + DMs with pairing controls.",
-          configHint: "",
-          docsUrl: "https://docs.openclaw.ai/channels/irc",
-        },
-        {
-          channel: "web",
-          label: "WebChat",
-          icon: "🌐",
-          setupType: "auto" as const,
-          setupCommand: "",
-          setupHint: "Built-in WebChat over WebSocket. Always available when the Gateway runs.",
-          configHint: "No setup needed — works automatically.",
-          docsUrl: "https://docs.openclaw.ai/web/webchat",
-        },
-      ];
-
-      // Merge known channels with live data
-      const enriched = KNOWN_CHANNELS.map((known) => {
-        const live = channels.find((c) => c.channel === known.channel);
-        return {
-          ...known,
-          enabled: live?.enabled ?? false,
-          configured: live?.configured ?? false,
-          accounts: live?.accounts ?? [],
-          statuses: live?.statuses ?? [],
-          dmPolicy: live?.dmPolicy,
-          groupPolicy: live?.groupPolicy,
-        };
-      });
-
-      // Also include any channels from the CLI that aren't in KNOWN_CHANNELS
-      // (plugins, extensions)
-      const knownIds = new Set(KNOWN_CHANNELS.map((k) => k.channel));
-      const extras = channels
-        .filter((c) => !knownIds.has(c.channel))
-        .map((c) => ({
-          channel: c.channel,
-          label: c.channel.charAt(0).toUpperCase() + c.channel.slice(1),
-          icon: "📡",
-          setupType: "cli" as const,
-          setupCommand: `openclaw channels add --channel ${c.channel}`,
-          setupHint: "Plugin channel.",
-          configHint: "",
-          docsUrl: `https://docs.openclaw.ai/channels/${c.channel}`,
-          enabled: c.enabled,
-          configured: c.configured,
-          accounts: c.accounts,
-          statuses: c.statuses,
-          dmPolicy: c.dmPolicy,
-          groupPolicy: c.groupPolicy,
-        }));
-
-      return NextResponse.json({ channels: [...enriched, ...extras] });
-    }
-
-    // scope=status
-    const status = await gatewayCall<Record<string, unknown>>(
-      "channels.status",
-      {},
-      10000,
-    );
-    return NextResponse.json(status);
+    const channels = await buildChannelStatuses();
+    return NextResponse.json({ channels });
   } catch (err) {
-    console.error("Channels API GET error:", err);
+    console.error("Channels GET error:", err);
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }
 }
 
-/**
- * POST /api/channels
- *
- * Body:
- *   { action: "add", channel: "telegram", token: "123:abc" }
- *   { action: "login", channel: "whatsapp", account?: "work" }   -- returns streaming QR/instructions
- *   { action: "logout", channel: "whatsapp", account?: "default" }
- *   { action: "enable", channel: "telegram" }
- *   { action: "disable", channel: "telegram" }
- */
+/* ── POST /api/channels ── */
+
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
@@ -545,179 +162,77 @@ export async function POST(request: NextRequest) {
     const channel = body.channel as string;
 
     if (!channel) {
-      return NextResponse.json({ error: "Channel is required" }, { status: 400 });
+      return NextResponse.json({ error: "channel is required" }, { status: 400 });
     }
 
     switch (action) {
-      case "add": {
-        // Telegram is configured via config (channels.telegram.botToken), not "channels add".
-        // Docs: https://docs.openclaw.ai/channels/telegram — "configure token in config/env, then start gateway".
-        if (channel === "telegram" && body.token) {
-          const telegramPatch: Record<string, unknown> = {
-            enabled: true,
-            botToken: (body.token as string).trim(),
-            dmPolicy: (body.dmPolicy as string) || "pairing",
-          };
+      /* ── Connect (add token) ── */
+      case "connect": {
+        const token = (body.token as string || "").trim();
+        if (!token && channel !== "whatsapp") {
+          return NextResponse.json({ error: "token is required" }, { status: 400 });
+        }
+
+        if (channel === "whatsapp") {
+          // WhatsApp: enable in config, QR login handled separately by /api/channels/qr
           await patchConfig(
-            { channels: { telegram: telegramPatch } },
+            { channels: { whatsapp: { enabled: true, dmPolicy: "pairing", groupPolicy: "mention" } } },
             { restartDelayMs: 2000 },
           );
-          return NextResponse.json({
-            ok: true,
-            output: "Telegram channel configured. The gateway will pick up the new token after restart.",
-            pluginAutoEnabled: false,
-            restartRecommended: true,
-          });
+          return NextResponse.json({ ok: true, message: "WhatsApp enabled. Use QR login to link your phone." });
         }
 
-        const pluginSetup = await ensureChannelPluginReady(channel);
-        const args = ["channels", "add", "--channel", channel];
-        // Token-based channels
-        if (body.token) args.push("--token", body.token as string);
-        if (body.appToken) args.push("--app-token", body.appToken as string);
-        if (body.account) args.push("--account", body.account as string);
+        // Telegram / Discord: save token via config patch
+        const patch: Record<string, unknown> = {
+          enabled: true,
+          dmPolicy: (body.dmPolicy as string) || "pairing",
+        };
+        if (channel === "telegram") patch.botToken = token;
+        else if (channel === "discord") patch.token = token;
+        else patch.botToken = token;
 
-        let output = "";
-        try {
-          output = await runCli(args, 30000);
-        } catch (error) {
-          if (isUnknownChannelError(error, channel)) {
-            await explainUnknownChannelError(channel, error);
-          }
-          throw error;
-        }
-        const trimmed = output.trim();
-        const merged = pluginSetup.note
-          ? [pluginSetup.note, trimmed].filter(Boolean).join("\n\n")
-          : trimmed;
-        return NextResponse.json({
-          ok: true,
-          output: merged,
-          pluginAutoEnabled: pluginSetup.autoEnabled,
-          restartRecommended: pluginSetup.autoEnabled,
-        });
+        await patchConfig(
+          { channels: { [channel]: patch } },
+          { restartDelayMs: 2000 },
+        );
+
+        return NextResponse.json({ ok: true, message: `${channel} connected. Gateway is restarting.` });
       }
 
-      case "login": {
-        const pluginSetup = await ensureChannelPluginReady(channel);
-        // Login is interactive (QR code for WhatsApp, etc.)
-        // We'll stream this. For now, return instructions.
-        const args = ["channels", "login", "--channel", channel];
-        if (body.account) args.push("--account", body.account as string);
-
-        // WhatsApp login is interactive and handled by the QR modal flow.
+      /* ── Disconnect (remove channel) ── */
+      case "disconnect": {
+        // WhatsApp: logout session first
         if (channel === "whatsapp") {
-          const command = `openclaw channels login --channel ${channel}${body.account ? ` --account ${body.account}` : ""}`;
-          const messageBase = `This channel requires interactive login. Run this in the Terminal:\n\n${command}`;
-          const message = pluginSetup.note
-            ? `${pluginSetup.note}\n\n${messageBase}`
-            : messageBase;
-          return NextResponse.json({
-            ok: true,
-            interactive: true,
-            message,
-            command,
-            pluginAutoEnabled: pluginSetup.autoEnabled,
-            restartRecommended: pluginSetup.autoEnabled,
-          });
+          try {
+            await gatewayCall("channels.logout", { channel }, 15000);
+          } catch { /* best effort */ }
         }
 
-        if (channel === "signal") {
-          return NextResponse.json(
-            {
-              error:
-                "Signal setup is manual. Follow the official Signal channel guide to register signal-cli and configure the channel before enabling it in Mission Control.",
-            },
-            { status: 400 },
-          );
-        }
+        // Disable and clear credentials
+        const clearPatch: Record<string, unknown> = { enabled: false };
+        if (channel === "telegram") clearPatch.botToken = "";
+        if (channel === "discord") clearPatch.token = "";
 
-        let output = "";
-        try {
-          output = await runCli(args, 30000);
-        } catch (error) {
-          if (isUnknownChannelError(error, channel)) {
-            await explainUnknownChannelError(channel, error);
-          }
-          throw error;
-        }
-        const trimmed = output.trim();
-        const merged = pluginSetup.note
-          ? [pluginSetup.note, trimmed].filter(Boolean).join("\n\n")
-          : trimmed;
-        return NextResponse.json({
-          ok: true,
-          output: merged,
-          pluginAutoEnabled: pluginSetup.autoEnabled,
-          restartRecommended: pluginSetup.autoEnabled,
-        });
+        await patchConfig(
+          { channels: { [channel]: clearPatch } },
+          { restartDelayMs: 2000 },
+        );
+
+        return NextResponse.json({ ok: true, message: `${channel} disconnected.` });
       }
 
-      case "logout": {
-        try {
-          const result = await gatewayCall<Record<string, unknown>>(
-            "channels.logout",
-            {
-              channel,
-              ...(body.account ? { accountId: body.account as string } : {}),
-            },
-            15000,
-          );
-          return NextResponse.json({ ok: true, result });
-        } catch (error) {
-          // Some channels do not support runtime logout via gateway.
-          const args = ["channels", "logout", "--channel", channel];
-          if (body.account) args.push("--account", body.account as string);
-          const output = await runCli(args, 15000);
-          return NextResponse.json({
-            ok: true,
-            output: output.trim(),
-            fallback: "cli",
-            warning: String(error),
-          });
-        }
-      }
-
-      case "enable": {
-        const pluginSetup = await ensureChannelPluginReady(channel);
-        // Enable via config.patch
-        const configData = await gatewayCall<Record<string, unknown>>("config.get", undefined, 10000);
-        const hash = configData.hash as string;
-        const patchRaw = JSON.stringify({
-          channels: { [channel]: { enabled: true } },
-        });
-        await gatewayCall("config.patch", { raw: patchRaw, baseHash: hash, restartDelayMs: 2000 }, 15000);
-        return NextResponse.json({
-          ok: true,
-          pluginAutoEnabled: pluginSetup.autoEnabled,
-          restartRecommended: pluginSetup.autoEnabled,
-          note: pluginSetup.note,
-        });
-      }
-
-      case "disable": {
-        const configData = await gatewayCall<Record<string, unknown>>("config.get", undefined, 10000);
-        const hash = configData.hash as string;
-        const patchRaw = JSON.stringify({
-          channels: { [channel]: { enabled: false } },
-        });
-        await gatewayCall("config.patch", { raw: patchRaw, baseHash: hash, restartDelayMs: 2000 }, 15000);
-        return NextResponse.json({ ok: true });
-      }
-
+      /* ── Update policy ── */
       case "set-policy": {
-        const dmPolicy = body.dmPolicy as string | undefined;
-        const groupPolicy = body.groupPolicy as string | undefined;
-        if (!dmPolicy && !groupPolicy) {
+        const patch: Record<string, unknown> = {};
+        if (body.dmPolicy) patch.dmPolicy = body.dmPolicy;
+        if (body.groupPolicy) patch.groupPolicy = body.groupPolicy;
+        if (Object.keys(patch).length === 0) {
           return NextResponse.json({ error: "dmPolicy or groupPolicy required" }, { status: 400 });
         }
-        const configData = await gatewayCall<Record<string, unknown>>("config.get", undefined, 10000);
-        const hash = configData.hash as string;
-        const patch: Record<string, unknown> = {};
-        if (dmPolicy) patch.dmPolicy = dmPolicy;
-        if (groupPolicy) patch.groupPolicy = groupPolicy;
-        const patchRaw = JSON.stringify({ channels: { [channel]: patch } });
-        await gatewayCall("config.patch", { raw: patchRaw, baseHash: hash, restartDelayMs: 2000 }, 15000);
+        await patchConfig(
+          { channels: { [channel]: patch } },
+          { restartDelayMs: 2000 },
+        );
         return NextResponse.json({ ok: true });
       }
 
@@ -725,7 +240,7 @@ export async function POST(request: NextRequest) {
         return NextResponse.json({ error: `Unknown action: ${action}` }, { status: 400 });
     }
   } catch (err) {
-    console.error("Channels API POST error:", err);
+    console.error("Channels POST error:", err);
     return NextResponse.json({ error: String(err) }, { status: 500 });
   }
 }

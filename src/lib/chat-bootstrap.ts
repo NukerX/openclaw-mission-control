@@ -1,6 +1,9 @@
+import { readFile } from "fs/promises";
+import { join } from "path";
 import { fetchGatewaySessions, summarizeSessionsByAgent } from "@/lib/gateway-sessions";
 import { getFriendlyModelName } from "@/lib/model-metadata";
 import { gatewayCall } from "@/lib/openclaw";
+import { getOpenClawHome } from "@/lib/paths";
 
 type GatewayConfigGet = {
   parsed?: Record<string, unknown>;
@@ -24,9 +27,15 @@ export type ChatBootstrapModel = {
   name: string;
 };
 
+export type ChatBootstrapProvider = {
+  id: string;
+  name: string;
+};
+
 export type ChatBootstrapResponse = {
   agents: ChatBootstrapAgent[];
   models: ChatBootstrapModel[];
+  connectedProviders: ChatBootstrapProvider[];
   warnings?: string[];
   degraded?: boolean;
 };
@@ -136,6 +145,14 @@ export async function buildChatBootstrap(): Promise<ChatBootstrapResponse> {
     resolvedConfig = isRecord(configData.resolved) ? configData.resolved : {};
   } catch (error) {
     warnings.push(`config.get unavailable: ${String(error)}`);
+
+    // Disk fallback: read openclaw.json directly (merged nested + outer)
+    try {
+      const { readConfigFile } = await import("@/lib/paths");
+      const diskConfig = await readConfigFile();
+      parsedConfig = diskConfig;
+      resolvedConfig = diskConfig;
+    } catch { /* no config on disk either */ }
   }
 
   let sessions = [] as Awaited<ReturnType<typeof fetchGatewaySessions>>;
@@ -242,6 +259,31 @@ export async function buildChatBootstrap(): Promise<ChatBootstrapResponse> {
       return a.id.localeCompare(b.id);
     });
 
+  // Collect providers that have credentials configured
+  const envBlock = isRecord(resolvedConfig.env ?? parsedConfig.env)
+    ? (resolvedConfig.env ?? parsedConfig.env) as Record<string, unknown>
+    : {};
+  const authBlock = isRecord(resolvedConfig.auth ?? parsedConfig.auth)
+    ? (resolvedConfig.auth ?? parsedConfig.auth) as Record<string, unknown>
+    : {};
+  const authProfiles = isRecord(authBlock.profiles) ? authBlock.profiles : {};
+
+  const connectedProviders = new Set<string>();
+  // Check auth profiles for connected providers
+  for (const key of Object.keys(authProfiles)) {
+    const provider = key.split(":")[0];
+    if (provider) connectedProviders.add(provider);
+  }
+  // Check env keys for provider API keys
+  const envKeyToProvider: Record<string, string> = {
+    ANTHROPIC_API_KEY: "anthropic", OPENAI_API_KEY: "openai",
+    GEMINI_API_KEY: "google", OPENROUTER_API_KEY: "openrouter",
+    GROQ_API_KEY: "groq", XAI_API_KEY: "xai", MISTRAL_API_KEY: "mistral",
+  };
+  for (const [envKey, provider] of Object.entries(envKeyToProvider)) {
+    if (envBlock[envKey]) connectedProviders.add(provider);
+  }
+
   const modelKeys = uniqueStrings([
     defaultsModel.primary,
     ...defaultsModel.fallbacks,
@@ -257,9 +299,19 @@ export async function buildChatBootstrap(): Promise<ChatBootstrapResponse> {
     }))
     .sort((a, b) => a.name.localeCompare(b.name));
 
+  const PROVIDER_NAMES: Record<string, string> = {
+    anthropic: "Anthropic", openai: "OpenAI", google: "Google",
+    openrouter: "OpenRouter", groq: "Groq", xai: "xAI", mistral: "Mistral",
+  };
+
+  const providerList: ChatBootstrapProvider[] = [...connectedProviders]
+    .map((id) => ({ id, name: PROVIDER_NAMES[id] || id }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+
   return {
     agents,
     models,
+    connectedProviders: providerList,
     warnings: warnings.length > 0 ? warnings : undefined,
     degraded: warnings.length > 0,
   };
