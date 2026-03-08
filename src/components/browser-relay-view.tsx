@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Bug,
   CheckCircle2,
@@ -87,7 +87,7 @@ type RelayPostResponse = {
   error?: string;
 };
 
-type RelayAction = "install-extension" | "start" | "stop" | "restart" | "open-test-tab" | "snapshot-test";
+type RelayAction = "install-extension" | "start" | "stop" | "restart" | "open-test-tab" | "snapshot-test" | "screenshot";
 
 type PrimaryAction = {
   action: RelayAction;
@@ -224,6 +224,18 @@ function prettyHost(url: string): string {
   }
 }
 
+function isValidBrowserUrl(url: string): boolean {
+  const trimmed = url.trim();
+  if (!trimmed) return false;
+  try {
+    const parsed = new URL(trimmed);
+    const allowed = ["http:", "https:"];
+    return allowed.includes(parsed.protocol);
+  } catch {
+    return false;
+  }
+}
+
 function isLoopbackHost(url: string | undefined): boolean {
   if (!url) return false;
   try {
@@ -271,19 +283,30 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
   const [notice, setNotice] = useState<string | null>(null);
   const [actionOutput, setActionOutput] = useState("");
   const [showAdvanced, setShowAdvanced] = useState(false);
+  const [screenshotSrc, setScreenshotSrc] = useState<string | null>(null);
+  const [screenshotLoading, setScreenshotLoading] = useState(false);
+  const [pollRetries, setPollRetries] = useState(0);
+  const loadAbortRef = useRef<AbortController | null>(null);
 
   const load = useCallback(
     async (silent = false) => {
+      // Abort any previous inflight load to prevent race conditions on rapid profile switches
+      loadAbortRef.current?.abort();
+      const controller = new AbortController();
+      loadAbortRef.current = controller;
       if (!silent) setLoading(true);
       setError(null);
       try {
         const qs = profile ? `?profile=${encodeURIComponent(profile)}` : "";
-        const res = await fetch(`/api/browser/relay${qs}`, { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        const timeoutId = setTimeout(() => controller.abort(), 10000);
+        const res = await fetch(`/api/browser/relay${qs}`, { cache: "no-store", signal: controller.signal });
+        clearTimeout(timeoutId);
         const data = (await res.json()) as RelayGetResponse;
         if (!res.ok || !data.ok || !data.snapshot) {
           throw new Error(data.error || `HTTP ${res.status}`);
         }
         setSnapshot(data.snapshot);
+        setPollRetries(0); // Reset backoff on success
         if (data.docsUrl) setDocsUrl(data.docsUrl);
 
         const statusProfile = (data.snapshot.status?.profile || "").trim();
@@ -296,7 +319,18 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
           if (first) setProfile(first);
         }
       } catch (err) {
+        // Ignore aborted requests (from rapid profile switches or component unmount)
+        if (err instanceof DOMException && err.name === "AbortError") return;
         const raw = err instanceof Error ? err.message : String(err);
+        if (silent) {
+          // Background poll failure — use exponential backoff before showing error
+          setPollRetries((prev) => {
+            if (prev < 3) return prev + 1; // silently retry up to 3 times
+            setError(raw);
+            return prev;
+          });
+          return;
+        }
         setError(raw);
       } finally {
         if (!silent) setLoading(false);
@@ -310,16 +344,21 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
   }, [load]);
 
   useEffect(() => {
+    // Exponential backoff on poll failures: 10s, 20s, 40s, 80s
+    const interval = Math.min(10000 * Math.pow(2, pollRetries), 80000);
     const pollId = window.setInterval(() => {
       if (document.visibilityState === "visible") void load(true);
-    }, 10000);
-    const onFocus = () => void load(true);
+    }, interval);
+    const onFocus = () => {
+      setPollRetries(0); // Reset backoff on manual focus
+      void load(true);
+    };
     window.addEventListener("focus", onFocus);
     return () => {
       window.clearInterval(pollId);
       window.removeEventListener("focus", onFocus);
     };
-  }, [load]);
+  }, [load, pollRetries]);
 
   const runAction = useCallback(
     async (action: RelayAction, payload?: Record<string, unknown>) => {
@@ -335,6 +374,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
             profile: profile || null,
             ...(payload || {}),
           }),
+          signal: AbortSignal.timeout(30000),
         });
         const data = (await res.json()) as RelayPostResponse;
         if (!res.ok || !data.ok) {
@@ -349,7 +389,11 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
         setNotice(actionSuccessMessage(action, noticeMode, isHosted));
       } catch (err) {
         const raw = err instanceof Error ? err.message : String(err);
-        setError(raw);
+        if (raw.includes("TimeoutError") || raw.includes("timed out") || raw.includes("aborted")) {
+          setError("Action timed out after 30 seconds. The server may still be processing — try refreshing.");
+        } else {
+          setError(raw);
+        }
       } finally {
         setActionBusy(null);
       }
@@ -378,6 +422,30 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
     }
   }, []);
 
+  const captureScreenshot = useCallback(async () => {
+    setScreenshotLoading(true);
+    try {
+      const res = await fetch("/api/browser/relay", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "screenshot", profile: profile || null }),
+        signal: AbortSignal.timeout(20000),
+      });
+      const data = (await res.json()) as RelayPostResponse;
+      if (!res.ok || !data.ok) throw new Error(data.error || "Screenshot failed");
+      const image = (data.result as { image?: string })?.image;
+      if (image) setScreenshotSrc(image);
+      else setError("No screenshot data returned.");
+    } catch (err) {
+      const raw = err instanceof Error ? err.message : String(err);
+      setError(`Screenshot failed: ${raw}`);
+    } finally {
+      setScreenshotLoading(false);
+    }
+  }, [profile]);
+
+  const isHeadless = Boolean(snapshot?.status?.headless) || isHosted;
+
   const activeTabs = snapshot?.tabs || [];
   const selectedProfile = profile || snapshot?.status?.profile || "";
   const inferredMode = useMemo<BrowserMode>(
@@ -392,8 +460,10 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
     mode === "extension"
       ? "Extension relay"
       : mode === "remote"
-        ? "Remote CDP"
-        : "Managed profile";
+        ? "Remote browser"
+        : isHeadless
+          ? "Background browser"
+          : "Managed browser";
   const setupDocsUrl = useMemo(() => {
     if (mode === "extension") {
       return (
@@ -507,13 +577,16 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
       };
     }
     if (!modeHealth.tabConnected) {
+      const isHeadless = Boolean(snapshot?.status?.headless) || isHosted;
       return {
         action: "open-test-tab",
         label: "Open Setup Tab",
         hint:
           mode === "extension"
             ? "Opens a tab where you can click the extension icon to connect."
-            : "Opens a test tab in this profile so browser control has a live target.",
+            : isHeadless
+              ? "Opens a tab in the background browser. Since the browser runs headless, use the screenshot preview below to see it."
+              : "Opens a test tab in this profile so browser control has a live target.",
         payload: { url: testUrl },
       };
     }
@@ -527,8 +600,11 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
   const guidance = useMemo(() => {
     const notes: string[] = [];
     if (!snapshot) return notes;
+    if (isHeadless && !isHosted) {
+      notes.push("Browser is running in headless mode. Use the screenshot preview to see what the browser is showing.");
+    }
     if (isHosted) {
-      notes.push("Running on a server \u2014 managed browser runs in the background. For cloud browsers, configure a remote CDP profile.");
+      notes.push("Running on a server \u2014 managed browser runs in the background. For cloud browsers, configure a remote browser profile.");
     }
     if (!isHosted && mode === "extension" && !modeHealth.installed) {
       notes.push("Install extension first, then open Chrome extensions and load unpacked.");
@@ -559,7 +635,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
       notes.push("Extension is optional in this mode; it is only required for extension relay profiles.");
     }
     return notes.slice(0, 4);
-  }, [isHosted, mode, modeHealth, snapshot]);
+  }, [isHeadless, isHosted, mode, modeHealth, snapshot]);
 
   const primaryTab = activeTabs[0] || null;
 
@@ -614,7 +690,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
       />
 
       <SectionBody width="narrow" className="space-y-4">
-        <div className="rounded-xl border border-border/70 bg-card p-4">
+        <div className="rounded-xl border border-border/70 bg-card p-4" role="region" aria-label="Quick start setup">
           <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
             <p className="text-sm font-medium text-foreground">Quick Start</p>
             {snapshot && statusPill("Ready", modeHealth.ready)}
@@ -656,6 +732,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
               }
               className="inline-flex items-center gap-1.5 rounded-md border border-border bg-card px-3 py-1.5 text-xs font-medium text-foreground hover:bg-muted disabled:opacity-60"
               disabled={loading || actionBusy !== null || !primaryAction}
+              aria-label={primaryAction?.label || "Run next setup step"}
             >
               <Sparkles className="h-3.5 w-3.5" />
               {actionBusy && primaryAction?.action === actionBusy
@@ -664,9 +741,16 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
             </button>
             <button
               type="button"
-              onClick={() => void runAction("open-test-tab", { url: testUrl })}
+              onClick={() => {
+                if (!isValidBrowserUrl(testUrl)) {
+                  setError("Invalid URL. Only http:// and https:// URLs are allowed.");
+                  return;
+                }
+                void runAction("open-test-tab", { url: testUrl });
+              }}
               className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-60"
               disabled={loading || actionBusy !== null}
+              aria-label="Open a test tab in the browser"
             >
               <Globe className="h-3.5 w-3.5" />
               Open Setup Tab
@@ -685,7 +769,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
           )}
         </div>
 
-        <div className="rounded-xl border border-border/70 bg-card p-4">
+        <div className="rounded-xl border border-border/70 bg-card p-4" role="region" aria-label="Browser status">
           <p className="mb-3 text-sm font-medium text-foreground">Current Status</p>
           {loading && !snapshot ? (
             <div className="space-y-2">
@@ -699,12 +783,12 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
               <p>Browser: <code>{snapshot?.status?.detectedBrowser || "unknown"}</code></p>
               <p>Connected tabs: <code>{activeTabs.length}</code></p>
               <p>Connection mode: <code>{modeLabel}</code></p>
-              <p>CDP endpoint: <code>{snapshot?.status?.cdpUrl || "unknown"}</code></p>
+              <p>Debug connection: <code>{snapshot?.status?.cdpUrl || "not connected"}</code></p>
             </div>
           )}
         </div>
 
-        <div className="rounded-xl border border-border/70 bg-card p-4">
+        <div className="rounded-xl border border-border/70 bg-card p-4" role="region" aria-label="Browser controls">
           <p className="mb-3 text-sm font-medium text-foreground">Controls</p>
 
           <div className="mb-3 grid gap-2 md:grid-cols-2">
@@ -715,13 +799,22 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
                 onChange={(e) => setProfile(e.target.value)}
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                 disabled={loading || actionBusy !== null}
+                aria-label="Select a browser profile"
               >
+                {(snapshot?.profiles || []).length === 0 && (
+                  <option value="" disabled>No profiles available</option>
+                )}
                 {(snapshot?.profiles || []).map((p) => (
                   <option key={p.name} value={p.name}>
                     {p.name}{p.isDefault ? " (default)" : ""}
                   </option>
                 ))}
               </select>
+              {(snapshot?.profiles || []).length === 0 && !loading && (
+                <p className="text-xs text-amber-400">
+                  No browser profiles found. Run <code className="rounded bg-muted px-1">openclaw browser create-profile</code> to create one.
+                </p>
+              )}
             </label>
             <label className="space-y-1 md:min-w-56 md:max-w-56">
               <span className="text-xs text-muted-foreground">Quick-open URL</span>
@@ -731,6 +824,8 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
                 className="w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
                 placeholder="https://example.com"
                 disabled={loading || actionBusy !== null}
+                aria-label="URL to open in browser"
+                type="url"
               />
             </label>
           </div>
@@ -741,6 +836,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
               onClick={() => void runAction("start")}
               className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-60"
               disabled={loading || actionBusy !== null}
+              aria-label={mode === "remote" ? "Connect to remote browser" : "Start browser profile"}
             >
               <Play className="h-3.5 w-3.5" />{" "}
               {mode === "remote" ? "Connect Remote Browser" : "Start Browser Profile"}
@@ -750,15 +846,17 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
               onClick={() => void runAction("restart")}
               className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-60"
               disabled={loading || actionBusy !== null}
+              aria-label={mode === "remote" ? "Reconnect remote browser" : "Reconnect browser relay"}
             >
               <RotateCw className="h-3.5 w-3.5" />{" "}
-              {mode === "remote" ? "Reconnect Remote CDP" : "Reconnect Relay"}
+              {mode === "remote" ? "Reconnect Remote" : "Reconnect Relay"}
             </button>
             <button
               type="button"
               onClick={() => void runAction("stop")}
               className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-60"
               disabled={loading || actionBusy !== null}
+              aria-label="Stop browser relay"
             >
               <Square className="h-3.5 w-3.5" /> Stop Relay
             </button>
@@ -767,15 +865,21 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
               onClick={() => void runAction("snapshot-test")}
               className="inline-flex items-center gap-1 rounded-md border border-border px-3 py-1.5 text-xs hover:bg-muted disabled:opacity-60"
               disabled={loading || actionBusy !== null}
+              aria-label="Test browser connection"
             >
-              <Bug className="h-3.5 w-3.5" /> Test Browser Connection
+              <Bug className="h-3.5 w-3.5" /> Test Connection
             </button>
           </div>
         </div>
 
-        <div className="rounded-xl border border-border/70 bg-card p-4">
+        <div className="rounded-xl border border-border/70 bg-card p-4" role="region" aria-label="Connected browser tabs">
           <p className="mb-3 text-sm font-medium text-foreground">Connected Tabs</p>
-          {activeTabs.length === 0 ? (
+          {loading && !snapshot ? (
+            <div className="space-y-2">
+              <div className="h-12 animate-pulse rounded-lg bg-muted" />
+              <div className="h-8 w-3/4 animate-pulse rounded bg-muted" />
+            </div>
+          ) : activeTabs.length === 0 ? (
             <p className="text-xs text-muted-foreground">
               {!isHosted && mode === "extension"
                 ? "No connected tabs yet. Open any tab and click the OpenClaw extension icon."
@@ -817,6 +921,46 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
           )}
         </div>
 
+        {isHeadless && modeHealth.running && modeHealth.cdpReady && (
+          <div className="rounded-xl border border-border/70 bg-card p-4" role="region" aria-label="Browser preview">
+            <div className="mb-3 flex items-center justify-between">
+              <p className="text-sm font-medium text-foreground">Browser Preview</p>
+              <button
+                type="button"
+                onClick={() => void captureScreenshot()}
+                className="inline-flex items-center gap-1.5 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-60"
+                disabled={screenshotLoading || actionBusy !== null}
+                aria-label="Capture a screenshot of the browser"
+              >
+                {screenshotLoading ? (
+                  <span className="inline-flex items-center gap-0.5">
+                    <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:0ms]" />
+                    <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:150ms]" />
+                    <span className="h-1 w-1 animate-bounce rounded-full bg-current [animation-delay:300ms]" />
+                  </span>
+                ) : (
+                  <RefreshCw className="h-3 w-3" />
+                )}
+                Capture Screenshot
+              </button>
+            </div>
+            {screenshotSrc ? (
+              <div className="overflow-hidden rounded-lg border border-border">
+                {/* eslint-disable-next-line @next/next/no-img-element */}
+                <img
+                  src={screenshotSrc}
+                  alt="Browser screenshot preview"
+                  className="w-full"
+                />
+              </div>
+            ) : (
+              <p className="text-xs text-muted-foreground">
+                Browser is running in the background (headless). Click &ldquo;Capture Screenshot&rdquo; to see what the browser is showing.
+              </p>
+            )}
+          </div>
+        )}
+
         {guidance.length > 0 && (
           <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 p-4">
             <div className="mb-2 inline-flex items-center gap-1 text-sm font-medium text-amber-200">
@@ -832,7 +976,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
         )}
 
         {friendlyError && (
-          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200">
+          <div className="rounded-md border border-red-500/30 bg-red-500/10 p-3 text-xs text-red-200" role="alert">
             {friendlyError}
             {showAdvanced && error && friendlyError !== error && (
               <p className="mt-2 text-[11px] text-red-100/70">Raw error: {error}</p>
@@ -841,7 +985,7 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
         )}
 
         {notice && (
-          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-200">
+          <div className="rounded-md border border-emerald-500/30 bg-emerald-500/10 p-3 text-xs text-emerald-200" role="status">
             {notice}
           </div>
         )}
@@ -852,13 +996,13 @@ export function BrowserRelayView({ isHosted = false }: { isHosted?: boolean }) {
             <div className="mb-3 flex flex-wrap gap-2">
               {!isHosted && statusPill("Extension", Boolean(snapshot?.health.installed))}
               {statusPill("Running", Boolean(snapshot?.health.running))}
-              {statusPill("CDP Ready", Boolean(snapshot?.health.cdpReady))}
+              {statusPill("Connected", Boolean(snapshot?.health.cdpReady))}
               {statusPill("Tab Connected", Boolean(snapshot?.health.tabConnected))}
               {statusPill("Relay Ready", modeHealth.ready)}
             </div>
 
             <div className="space-y-1 text-sm text-muted-foreground">
-              <p>CDP URL: <code>{snapshot?.status?.cdpUrl || "unknown"}</code></p>
+              <p>Debug endpoint: <code>{snapshot?.status?.cdpUrl || "not connected"}</code></p>
               <p>Executable: <code>{snapshot?.status?.detectedExecutablePath || "unknown"}</code></p>
               {!isHosted && (
                 <>

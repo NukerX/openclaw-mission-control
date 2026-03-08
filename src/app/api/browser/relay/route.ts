@@ -8,6 +8,40 @@ import { getClient } from "@/lib/openclaw-client";
 export const dynamic = "force-dynamic";
 export const revalidate = 0;
 
+// Simple in-memory rate limiter: max 30 requests per 10 seconds per IP
+const rateLimitMap = new Map<string, { count: number; resetAt: number }>();
+const RATE_LIMIT_WINDOW = 10_000;
+const RATE_LIMIT_MAX = 30;
+
+function checkRateLimit(request: NextRequest): NextResponse | null {
+  const ip = request.headers.get("x-forwarded-for")?.split(",")[0]?.trim() || "unknown";
+  const now = Date.now();
+  const entry = rateLimitMap.get(ip);
+  if (!entry || now > entry.resetAt) {
+    rateLimitMap.set(ip, { count: 1, resetAt: now + RATE_LIMIT_WINDOW });
+    return null;
+  }
+  entry.count++;
+  if (entry.count > RATE_LIMIT_MAX) {
+    return NextResponse.json(
+      { ok: false, error: "Too many requests. Please wait a moment and try again." },
+      { status: 429, headers: { "Retry-After": String(Math.ceil((entry.resetAt - now) / 1000)) } }
+    );
+  }
+  return null;
+}
+
+// Clean up stale entries every 60 seconds
+if (typeof globalThis !== "undefined") {
+  const cleanup = () => {
+    const now = Date.now();
+    rateLimitMap.forEach((entry, key) => {
+      if (now > entry.resetAt) rateLimitMap.delete(key);
+    });
+  };
+  setInterval(cleanup, 60_000);
+}
+
 type BrowserStatus = {
   enabled?: boolean;
   profile?: string;
@@ -238,6 +272,8 @@ async function buildSnapshot(profile: string | null): Promise<RelaySnapshot> {
 }
 
 export async function GET(request: NextRequest) {
+  const rateLimited = checkRateLimit(request);
+  if (rateLimited) return rateLimited;
   try {
     const { searchParams } = new URL(request.url);
     const profile = sanitizeProfile(searchParams.get("profile"));
@@ -257,6 +293,8 @@ export async function GET(request: NextRequest) {
 }
 
 export async function POST(request: NextRequest) {
+  const rateLimited = checkRateLimit(request);
+  if (rateLimited) return rateLimited;
   let profile: string | null = null;
   try {
     const body = (await request.json().catch(() => ({}))) as {
@@ -294,6 +332,20 @@ export async function POST(request: NextRequest) {
       }
       case "open-test-tab": {
         const targetUrl = (body.url || "").trim() || "https://docs.openclaw.ai/tools/browser";
+        try {
+          const parsed = new URL(targetUrl);
+          if (!["http:", "https:"].includes(parsed.protocol)) {
+            return NextResponse.json(
+              { ok: false, error: "Invalid URL protocol. Only http:// and https:// URLs are allowed." },
+              { status: 400 }
+            );
+          }
+        } catch {
+          return NextResponse.json(
+            { ok: false, error: "Invalid URL format." },
+            { status: 400 }
+          );
+        }
         result = await gwPost<Record<string, unknown>>(
           "/browser/open",
           { url: targetUrl, profile },
@@ -307,6 +359,32 @@ export async function POST(request: NextRequest) {
           { efficient: true, limit: 60, profile },
           25000
         );
+        break;
+      }
+      case "screenshot": {
+        const client = await getClient();
+        const screenshotRes = await client.gatewayFetch("/browser/screenshot", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ profile, format: "png", fullPage: false }),
+          signal: AbortSignal.timeout(15000),
+        });
+        if (!screenshotRes.ok) {
+          throw new Error(`Screenshot failed: ${screenshotRes.status}`);
+        }
+        const contentType = screenshotRes.headers.get("content-type") || "";
+        if (contentType.includes("image/")) {
+          const buffer = Buffer.from(await screenshotRes.arrayBuffer());
+          const base64 = buffer.toString("base64");
+          result = { image: `data:image/png;base64,${base64}` };
+        } else {
+          const data = await screenshotRes.json() as Record<string, unknown>;
+          if (data.image && typeof data.image === "string") {
+            result = { image: data.image.startsWith("data:") ? data.image : `data:image/png;base64,${data.image}` };
+          } else {
+            result = data;
+          }
+        }
         break;
       }
       default:
