@@ -4320,6 +4320,8 @@ export function AgentsView() {
   const [selectedWorkspacePath, setSelectedWorkspacePath] = useState<string | null>(null);
   const [showAddModal, setShowAddModal] = useState(false);
   const [savedAgentOrder, setSavedAgentOrder] = useState<string[]>(loadSavedAgentOrder);
+  const fetchInFlightRef = useRef<Promise<void> | null>(null);
+  const hasLoadedRef = useRef(false);
 
   const handleAgentClick = useCallback((id: string) => {
     setSelectedId(id);
@@ -4348,30 +4350,42 @@ export function AgentsView() {
   }, [router]);
 
   const fetchAgents = useCallback(async () => {
-    try {
-      const res = await fetch("/api/agents", { cache: "no-store", signal: AbortSignal.timeout(10000) });
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const json = await res.json();
-      const orderedAgents = applySavedOrder(
-        Array.isArray(json.agents) ? json.agents : [],
-        savedAgentOrder
-      );
-      setData({
-        ...json,
-        agents: orderedAgents,
-      });
-      setError(null);
-      setSelectedId((prev) => {
-        if (prev && orderedAgents.some((a: Agent) => a.id === prev)) return prev;
-        if (orderedAgents.length === 0) return null;
-        const def = orderedAgents.find((a: Agent) => a.isDefault);
-        return def?.id || orderedAgents[0].id;
-      });
-    } catch (err) {
-      setError(String(err));
-    } finally {
-      setLoading(false);
+    if (fetchInFlightRef.current) {
+      return fetchInFlightRef.current;
     }
+
+    const request = (async () => {
+      try {
+        const res = await fetch("/api/agents", { cache: "no-store", signal: AbortSignal.timeout(10000) });
+        if (!res.ok) throw new Error(`HTTP ${res.status}`);
+        const json = await res.json();
+        const orderedAgents = applySavedOrder(
+          Array.isArray(json.agents) ? json.agents : [],
+          savedAgentOrder
+        );
+        setData({
+          ...json,
+          agents: orderedAgents,
+        });
+        setError(null);
+        hasLoadedRef.current = true;
+        setSelectedId((prev) => {
+          if (prev && orderedAgents.some((a: Agent) => a.id === prev)) return prev;
+          if (orderedAgents.length === 0) return null;
+          const def = orderedAgents.find((a: Agent) => a.isDefault);
+          return def?.id || orderedAgents[0].id;
+        });
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        setError(hasLoadedRef.current ? `Background refresh failed: ${message}` : message);
+      } finally {
+        setLoading(false);
+        fetchInFlightRef.current = null;
+      }
+    })();
+
+    fetchInFlightRef.current = request;
+    return request;
   }, [savedAgentOrder]);
 
   const reorderAgents = useCallback(
@@ -4561,6 +4575,14 @@ export function AgentsView() {
           </div>
         }
       />
+
+      {error && data && (
+        <SectionBody width="content" padding="compact" innerClassName="pt-0">
+          <div className="rounded-xl border border-amber-200 bg-amber-50/80 px-4 py-3 text-sm text-amber-900 dark:border-amber-900/40 dark:bg-amber-950/30 dark:text-amber-100">
+            Agent data may be stale. {error}
+          </div>
+        </SectionBody>
+      )}
 
       {tab === "subagents" && (
         <SubagentsManagerView

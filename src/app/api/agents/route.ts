@@ -51,6 +51,8 @@ type AgentFull = {
 const SUBAGENT_RECENT_WINDOW_MS = 30 * 60 * 1000;
 const SUBAGENT_ACTIVE_WINDOW_MS = 2 * 60 * 1000;
 const AGENTS_CACHE_TTL_MS = 5000;
+const CONFIG_FETCH_TIMEOUT_MS = 3500;
+const SUPPLEMENTAL_GATEWAY_TIMEOUT_MS = 3000;
 
 type AgentsGetPayload = {
   agents: AgentFull[];
@@ -311,7 +313,7 @@ export async function GET() {
     // 1. Get config via gateway RPC (replaces both CLI agents list and file read)
     let configData: Awaited<ReturnType<typeof fetchConfig>> | null = null;
     try {
-      configData = await fetchConfig(10000);
+      configData = await fetchConfig(CONFIG_FETCH_TIMEOUT_MS);
     } catch {
       // Gateway might not be available — fall back to file
     }
@@ -411,14 +413,6 @@ export async function GET() {
       };
     });
 
-    // Use gateway RPC for channel status (replaces CLI "channels status --probe")
-    const channelStatusRaw = await gatewayCallWithRetry<Record<string, unknown>>(
-      "channels.status",
-      {},
-      12000,
-    ).catch(() => ({}));
-    const connectedChannels = connectedChannelsFromStatus(channelStatusRaw);
-
     // Build a lookup from merged config list.
     // Start with parsed entries, then layer resolved data on top for richer
     // metadata (the resolved config contains computed names, models, identities).
@@ -445,44 +439,68 @@ export async function GET() {
     }
 
     // Session state comes from gateway RPC (source of truth), not local files.
+    const [channelStatusResult, gatewaySessionsResult] = await Promise.allSettled([
+      gatewayCallWithRetry<Record<string, unknown>>(
+        "channels.status",
+        {},
+        SUPPLEMENTAL_GATEWAY_TIMEOUT_MS,
+        2,
+      ),
+      fetchGatewaySessions(SUPPLEMENTAL_GATEWAY_TIMEOUT_MS),
+    ]);
+
+    const connectedChannels =
+      channelStatusResult.status === "fulfilled"
+        ? connectedChannelsFromStatus(channelStatusResult.value)
+        : new Set<string>();
+
     let gatewaySessions = [] as Awaited<ReturnType<typeof fetchGatewaySessions>>;
     let sessionsByAgent = new Map<string, { sessionCount: number; totalTokens: number; lastActive: number }>();
     const runtimeSubagentsByAgent = new Map<
       string,
       AgentFull["runtimeSubagents"]
     >();
-    try {
-      gatewaySessions = await fetchGatewaySessions(10000);
-      sessionsByAgent = summarizeSessionsByAgent(gatewaySessions);
+    if (gatewaySessionsResult.status === "fulfilled") {
+      try {
+        gatewaySessions = gatewaySessionsResult.value;
+        sessionsByAgent = summarizeSessionsByAgent(gatewaySessions);
 
-      const now = Date.now();
-      for (const session of gatewaySessions) {
-        if (!isSubagentSessionKey(session.key)) continue;
-        if (!session.agentId) continue;
-        if (!session.updatedAt) continue;
-        const ageMs = Math.max(0, now - session.updatedAt);
-        if (ageMs > SUBAGENT_RECENT_WINDOW_MS) continue;
-        const row: AgentFull["runtimeSubagents"][number] = {
-          sessionKey: session.key,
-          sessionId: session.sessionId,
-          shortId: shortSubagentId(session.key, session.sessionId),
-          model: session.fullModel || "unknown",
-          totalTokens: session.totalTokens,
-          lastActive: session.updatedAt,
-          ageMs,
-          status: ageMs <= SUBAGENT_ACTIVE_WINDOW_MS ? "running" : "recent",
-        };
-        const existing = runtimeSubagentsByAgent.get(session.agentId) || [];
-        existing.push(row);
-        runtimeSubagentsByAgent.set(session.agentId, existing);
-      }
+        const now = Date.now();
+        for (const session of gatewaySessions) {
+          if (!isSubagentSessionKey(session.key)) continue;
+          if (!session.agentId) continue;
+          if (!session.updatedAt) continue;
+          const ageMs = Math.max(0, now - session.updatedAt);
+          if (ageMs > SUBAGENT_RECENT_WINDOW_MS) continue;
+          const row: AgentFull["runtimeSubagents"][number] = {
+            sessionKey: session.key,
+            sessionId: session.sessionId,
+            shortId: shortSubagentId(session.key, session.sessionId),
+            model: session.fullModel || "unknown",
+            totalTokens: session.totalTokens,
+            lastActive: session.updatedAt,
+            ageMs,
+            status: ageMs <= SUBAGENT_ACTIVE_WINDOW_MS ? "running" : "recent",
+          };
+          const existing = runtimeSubagentsByAgent.get(session.agentId) || [];
+          existing.push(row);
+          runtimeSubagentsByAgent.set(session.agentId, existing);
+        }
 
-      for (const [agentId, rows] of runtimeSubagentsByAgent.entries()) {
-        rows.sort((a, b) => b.lastActive - a.lastActive);
-        runtimeSubagentsByAgent.set(agentId, rows.slice(0, 6));
+        for (const [agentId, rows] of runtimeSubagentsByAgent.entries()) {
+          rows.sort((a, b) => b.lastActive - a.lastActive);
+          runtimeSubagentsByAgent.set(agentId, rows.slice(0, 6));
+        }
+      } catch {
+        // Keep agents page usable even if session shaping fails unexpectedly.
       }
-    } catch {
-      // Keep agents page usable even if gateway session RPC is temporarily unavailable.
+    } else {
+      try {
+        gatewaySessions = [];
+        sessionsByAgent = summarizeSessionsByAgent(gatewaySessions);
+      } catch {
+        // Keep agents page usable even if gateway session RPC is temporarily unavailable.
+      }
     }
 
     const agents: AgentFull[] = [];
